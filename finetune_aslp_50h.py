@@ -433,7 +433,8 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
     report.update(splits=summary, encoding_excluded_rows=len(encoding_errors),
                   audit_passed=not failures, failure_reasons=failures)
     atomic_json(run / "dataset_report.json", report)
-    for name in ("encoding_errors.json", "dataset_report.json"):
+    atomic_json(run / "training_manifests.json", splits)
+    for name in ("encoding_errors.json", "dataset_report.json", "training_manifests.json"):
         store.put(run / name, "preparation/" + name)
     if failures:
         raise ValueError('; '.join(failures) + f"; see {run / 'dataset_report.json'}")
@@ -582,8 +583,14 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             store.backup(run, checkpoint)
             self.samples(state)
             optional_plots(run)
-            # Refresh snapshot with samples; older remote snapshots remain recoverable.
-            store.backup(run, checkpoint)
+            # The required training snapshot is already secured. Sample refresh is optional.
+            try:
+                store.backup(run, checkpoint)
+            except Exception as exc:
+                LOG.warning("Optional sample snapshot refresh failed (%s); training snapshot remains saved",
+                            type(exc).__name__)
+                append_jsonl(run / "optional_errors.jsonl", dict(stage="sample_snapshot_refresh",
+                                                               error=str(exc)))
             LOG.info("Checkpoint %s safely archived%s", checkpoint.name,
                      " to " + store.remote if store.remote else " locally")
 
