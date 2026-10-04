@@ -6,6 +6,10 @@ trl==0.22.2
 # Explicit Hub dependency: compatible with the Transformers 4.x stack above.
 huggingface_hub>=0.34,<1
 datasets>=3.4.1,<4
+# Datasets 3.x caps fsspec at 2025.3.0. Match Kaggle's GCS driver to it;
+# otherwise preinstalled gcsfs 2025.12.0 breaks the strict pip check.
+fsspec[http]==2025.3.0
+gcsfs==2025.3.0
 snac>=1.2.1,<2
 soundfile>=0.13,<1
 numpy>=1.26,<3

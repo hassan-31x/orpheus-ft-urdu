@@ -131,6 +131,19 @@ Use the notebook cells at the end of this guide, or import `kaggle_run.ipynb`. R
 
 `requirements-kaggle.txt` pins Transformers/TRL to the versions used by the inspected upstream Orpheus notebook and bounds the dataset/codec dependencies. Unsloth and the CUDA stack are not fully locked across all possible Kaggle images. Pip resolves a compatible stack, and each run records `pip freeze`, CUDA, Torch and package versions. **A resolved requirements file is evidence of the environment, not proof it was tested on every GPU.**
 
+The file also pins **`fsspec==2025.3.0` and `gcsfs==2025.3.0` together**. [Datasets 3.6.0 requires fsspec at most 2025.3.0](https://pypi.org/pypi/datasets/3.6.0/json), while newer Kaggle images may preinstall a gcsfs version that requires a newer exact fsspec version. Installing the matched [gcsfs 2025.3.0 release](https://pypi.org/pypi/gcsfs/2025.3.0/json) keeps that dependency pair consistent. Do not upgrade only fsspec to fix the warning; that would conflict with the chosen Datasets 3.x stack. The notebook prints these installed versions before retaining the strict `pip check`.
+
+If you already hit `gcsfs 2025.12.0 ... fsspec==2025.12.0 ... fsspec 2025.3.0`, update your GitHub copy with the fixed requirements and rerun from a fresh Kaggle session. For an immediate repair in the current session, run:
+
+```python
+import subprocess, sys
+subprocess.run([sys.executable, "-m", "pip", "install",
+                "fsspec[http]==2025.3.0", "gcsfs==2025.3.0"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
+```
+
+Then rerun the import preflight and subsequent cells. This particular failure occurs before dataset processing or training starts; it does not indicate a failed model checkpoint. If `pip check` lists another conflict, retain its full output for diagnosis instead of disabling the check.
+
 Run `pip check` and the import preflight. Restart the kernel if installing packages has affected modules already imported in the notebook. The training subprocess imports Unsloth before Transformers as required. Do not manually install a random xformers/Torch wheel; match the [Unsloth installation guide](https://unsloth.ai/docs/get-started/install) to the runtime's Torch/CUDA versions if the preflight fails. Use Torch 2.6+ because resumable Trainer checkpoints load optimizer/RNG state through Torch serialization.
 
 Before a long run, create a **separate smoke config**:
@@ -366,6 +379,7 @@ Final validation loss is token cross entropy for the configured objective. It is
 
 | Problem | Action |
 |---|---|
+| `gcsfs` requires a different `fsspec` version | Use the updated requirements, which match both at `2025.3.0`. See Section 5 for the immediate repair cell. |
 | Hub preflight fails | Check `HF_TOKEN` Secret access, token write permission, repository ID/type, private visibility, storage allowance and Internet. Try `--mode storage-check` first. |
 | Missing Hub repo ID | Set `hf_repo_id`, `--hf-repo-id` or `ORPHEUS_HF_REPO` to `USERNAME/REPOSITORY`. |
 | Optional Drive preflight fails | Check notebook Secret access, OAuth expiry, remote name, Drive scope, quota and Internet. No GPU training begins before the probe succeeds. |
@@ -410,6 +424,7 @@ subprocess.run(["git", "checkout", REPO_REF], cwd=REPO, check=True)
 ```python
 import sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(REPO / "requirements-kaggle.txt")], check=True)
+subprocess.run([sys.executable, "-c", "from importlib.metadata import version; print({p: version(p) for p in ('datasets', 'fsspec', 'gcsfs')})"], check=True)
 subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
 subprocess.run([sys.executable, "-c", "from unsloth import FastLanguageModel; import torch; from snac import SNAC; assert torch.cuda.is_available(); assert tuple(map(int, torch.__version__.split('+')[0].split('.')[:2])) >= (2,6); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"], check=True)
 subprocess.run(["df", "-h", "/kaggle/working"], check=True)
