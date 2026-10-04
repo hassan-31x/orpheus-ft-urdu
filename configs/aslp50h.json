@@ -42,8 +42,10 @@
   "sample_repetition_penalty": 1.1,
   "sample_at_start": true,
   "session_hours": 25,
-  "minimum_train_hours": 40,
+  "minimum_train_hours": 35,
   "maximum_clip_seconds": 60,
   "invalid_row_policy": "skip",
-  "maximum_rejected_train_fraction": 0.05
+  "maximum_rejected_train_fraction": 0.05,
+  "enforce_retention_limits": false,
+  "optimizer": "adamw_torch"
 }

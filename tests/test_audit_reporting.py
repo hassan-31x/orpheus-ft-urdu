@@ -85,6 +85,21 @@ class RetentionPolicyTests(unittest.TestCase):
         _, errors = pipeline.audit_retention(splits, manifests, problems, cfg)
         self.assertTrue(any('validation' in e for e in errors))
 
+    def test_permissive_policy_logs_losses_instead_of_stopping(self):
+        splits, manifests, problems, cfg = self.base()
+        cfg.update(enforce_retention_limits=False, minimum_train_hours=40)
+        problems = [dict(split='train', duration_seconds=3600)] * 10
+        summary, errors = pipeline.audit_retention(splits, manifests, problems, cfg)
+        self.assertEqual(errors, [])
+        self.assertTrue(summary['train']['retention_warnings'])
+
+    def test_permissive_policy_still_requires_training_data(self):
+        splits, manifests, problems, cfg = self.base()
+        splits['train'] = []
+        cfg['enforce_retention_limits'] = False
+        _, errors = pipeline.audit_retention(splits, manifests, problems, cfg)
+        self.assertTrue(any('must retain' in error for error in errors))
+
     def test_optional_plot_failure_is_logged(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(pipeline, 'plot_logs', side_effect=RuntimeError('plot')):
             pipeline.optional_plots(Path(directory))
@@ -138,7 +153,7 @@ class EncodingFilterTests(unittest.TestCase):
             run = Path(directory)
             (run / 'data_errors.json').write_text('[]')
             (run / 'dataset_report.json').write_text(json.dumps({'manifests': {'train': {'rows': 2}, 'validation': {'rows': 1}}}))
-            store = SimpleNamespace(restore_files=lambda *args: None, put=lambda *args: None)
+            store = SimpleNamespace(restore_files=lambda *args, **kwargs: None, put=lambda *args: None)
             first_rows = rows()
             result = pipeline.encode_data(run, first_rows, cfg, None, 200000, run / 'cache', store, 'id', run)
             self.assertEqual(len(result['train']), 1)
@@ -152,6 +167,33 @@ class EncodingFilterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'strict'):
                 pipeline.encode_data(run, rows(), dict(cfg, invalid_row_policy='strict'), None,
                                      200000, run / 'cache', store, 'id', run)
+
+class LoggedDatasetRegressionTests(unittest.TestCase):
+    def test_actual_logged_split_passes_shipped_defaults(self):
+        # Reproduce the failure's observed counts and aggregate durations.
+        observed = {'train': (17392, 37.40962416666667, 17669, 277, .4075086111111111),
+                    'validation': (2129, 4.638137777777778, 2209, 80, .13379749999999999),
+                    'test': (2142, 4.691083888888889, 2208, 66, .103935)}
+        splits, manifests, rejected = {}, {}, []
+        for split, (count, hours, original, excluded, removed_hours) in observed.items():
+            splits[split] = [dict(duration=hours * 3600 / count)] * count
+            manifests[split] = dict(rows=original)
+            rejected.extend([dict(split=split, duration_seconds=removed_hours * 3600 / excluded)] * excluded)
+        cfg = json.loads(pipeline.DEFAULTS.read_text())
+        summary, errors = pipeline.audit_retention(splits, manifests, rejected, cfg)
+        self.assertEqual(errors, [])
+        self.assertEqual(cfg['minimum_train_hours'], 35)
+        self.assertAlmostEqual(summary['train']['hours'], 37.40962416666667)
+        self.assertAlmostEqual(summary['train']['rejected_known_hour_fraction'], .010775766991795123)
+        _, previous_errors = pipeline.audit_retention(splits, manifests, rejected, dict(cfg, minimum_train_hours=40, enforce_retention_limits=True))
+        self.assertTrue(any('minimum_train_hours=40' in error for error in previous_errors))
+
+    def test_notebook_explicitly_overrides_old_generated_minimum(self):
+        notebook = json.loads(Path('kaggle_run.ipynb').read_text())
+        settings = ''.join(notebook['cells'][2]['source'])
+        config = ''.join(notebook['cells'][6]['source'])
+        self.assertIn('MINIMUM_TRAIN_HOURS = 35', settings)
+        self.assertIn('cfg["minimum_train_hours"] = MINIMUM_TRAIN_HOURS', config)
 
 
 if __name__ == '__main__':

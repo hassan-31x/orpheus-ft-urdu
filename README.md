@@ -179,7 +179,7 @@ After verifying the smoke run, use `configs/aslp50h.json` with `max_steps=-1`. D
 | Optimizer / decay / grad clip | 8-bit AdamW / `0.001` / `1.0` |
 | Seed / sampling | 3407 / seeded random without replacement |
 | Checkpoint storage | Private Hugging Face model repository; `HF_TOKEN` + repository ID |
-| Sequence limit | 2048; fail rather than truncate |
+| Sequence limit | 2048; record context-overflow exclusions without truncating |
 | Loss | all sequence tokens; padding ignored |
 | Frame removal | none |
 | Checkpoint / periodic validation | every 100 optimizer steps |
@@ -386,7 +386,7 @@ Final validation loss is token cross entropy for the configured objective. It is
 | Optional Drive preflight fails | Check notebook Secret access, OAuth expiry, remote name, Drive scope, quota and Internet. No GPU training begins before the probe succeeds. |
 | ZIP download fails | Check sharing and Drive download quota. Upload the extracted paired dataset as a private Kaggle Dataset and set `data_dir` to its `/kaggle/input/...` path. |
 | No manifests found | Inspect archive folder names; set explicit `data_dir` and filenames. |
-| Training hours below 40 | Inspect `dataset_report.json`; you may have selected the 10h archive. Change `minimum_train_hours` only for a deliberately smaller new experiment. |
+| Training hours below 35 | Inspect `dataset_report.json`. The supplied ~47h archive includes validation/test; the logged retained training split is 37.41h, so the former 40h threshold was incorrect. |
 | Clip exceeds 2048 tokens | Review duration/text, then increase `max_length` for a new run/cache if it fits VRAM. Do not clip the audio while leaving the full transcript. |
 | CUDA OOM | Microbatch already defaults to 1. Use a smaller rank/new run or a larger GPU. Reduce context only after reviewing the data. Avoid concurrent model loading. |
 | NaN/Inf training logs | Inspect data and gradients; reduce LR in a new run. Preserve evidence; do not relabel the resumed experiment. |
@@ -417,6 +417,7 @@ REPO_URL = "https://github.com/hassan-31x/orpheus-ft-urdu.git"
 REPO_REF = "main"  # Use the same fixed commit for an experiment and its resumes.
 HF_REPO_ID = "YOUR_USERNAME/orpheus-urdu-checkpoints"  # EDIT THIS.
 AUDIT_ONLY = False  # Set True with GPU OFF to inspect data before training.
+MINIMUM_TRAIN_HOURS = 35  # The 47h archive contains ~38h train plus validation/test.
 SESSION_HOURS = 10.5  # Set below the limit displayed in your Kaggle account.
 REPO = Path("/kaggle/working/urdu-orpheus")
 
@@ -464,6 +465,8 @@ cfg = json.loads((REPO / "configs/aslp50h.json").read_text())
 cfg["checkpoint_backend"] = "huggingface"
 cfg["hf_repo_id"] = HF_REPO_ID
 cfg["session_hours"] = SESSION_HOURS
+cfg["minimum_train_hours"] = MINIMUM_TRAIN_HOURS
+print("Minimum retained TRAIN split hours:", cfg["minimum_train_hours"])
 print("Data policy:", cfg["invalid_row_policy"], "maximum training exclusion fraction:", cfg["maximum_rejected_train_fraction"])
 CONFIG = Path("/kaggle/working/run-config.json")
 CONFIG.write_text(json.dumps(cfg, indent=2))
@@ -555,10 +558,16 @@ Before using more GPU time, import the updated notebook, set `AUDIT_ONLY=True` i
 
 ## Automatic fallbacks and their limits
 
-Defaults: `invalid_row_policy="skip"`, `maximum_rejected_train_fraction=0.05`, and the existing `minimum_train_hours=40`. Count and measurable-duration limits both apply to training. Missing/corrupt files may have unknown duration; the report identifies these and still counts them toward the row limit. A small row fraction alone cannot establish a small hour fraction. Validation and test have separate original/retained counts and hours; discarded evaluation duplicates change the benchmark denominator and must be reported.
+Defaults: `invalid_row_policy="skip"`, `maximum_rejected_train_fraction=0.05`, and the existing `minimum_train_hours=35`. Count and measurable-duration limits both apply to training. Missing/corrupt files may have unknown duration; the report identifies these and still counts them toward the row limit. A small row fraction alone cannot establish a small hour fraction. Validation and test have separate original/retained counts and hours; discarded evaluation duplicates change the benchmark denominator and must be reported.
 
 Sequences exceeding `max_length` are excluded during SNAC encoding, without truncating their speech/text pair. Their reasons/durations are in `encoding_errors.json`, their cache chunks record accepted and excluded rows, and cached restarts restore the same decision. The training retention limits include **audit plus encoding** exclusions. `training_manifests.json` records the final retained rows; the updated `dataset_report.json` records final hours/counts. One epoch now means one pass over that retained partition.
 
 Monitoring synthesis and plotting failures are logged without stopping checkpoint work. Temporary storage errors retain the existing bounded retries. Broken model/token formats, changed/corrupt checkpoints, empty train/validation partitions, excessive training exclusions, CUDA failures and persistent checkpoint-upload errors still stop; continuing in those cases would not guarantee a usable, resumable experiment. Automatic changes to LR, context length, optimizer or batch geometry are not applied mid-run. No fallback can guarantee every Kaggle run succeeds.
 
 For this update, upload all changed files and re-import the notebook, then leave `AUDIT_ONLY=False` to audit, skip small exclusions and proceed automatically. Do not update a live process. Since the reported failure occurred before encoding/training, that failed run has no optimizer progress to lose. Existing trained runs require their original code/config/environment for exact resume.
+
+### Measured split sizes from the supplied run log
+
+The failed run retained **17,392 training clips / 37.4096h**, **2,129 validation clips / 4.6381h**, and **2,142 test clips / 4.6911h**: **46.7388h total**. The 423 exclusions were exact audio-byte duplicates: 277 train, 80 validation, 66 test. Training exclusions removed 0.4075h (about 24.45 minutes), or 1.0776% of measurable source training hours. The failure was the old `minimum_train_hours=40` check, not excessive filtering or a model/GPU error. The archive's total hours cannot be used as the minimum for its training partition.
+
+The default and notebook override now use `minimum_train_hours=35`, which accepts the measured training partition while retaining the 5% loss limits and rejecting accidentally selected small datasets. A regression test reproduces the logged split counts/hours and verifies the default accepts them. If an existing `/kaggle/working/run-config.json` still contains 40, set it to 35 before rerunning; changing the repository JSON alone does not rewrite a previously generated run config. This failure happened before tokenization and training, so there is no optimizer progress to preserve.

@@ -29,6 +29,8 @@ from orpheus_utils import (
     seal_checkpoint, sha256, training_row,
 )
 
+from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation
+
 LOG = logging.getLogger("orpheus_urdu")
 DEFAULTS = Path(__file__).parent / "configs/aslp50h.json"
 
@@ -91,6 +93,8 @@ def cli():
         p.error("invalid_row_policy must be skip or strict")
     if not 0 <= cfg["maximum_rejected_train_fraction"] < 1:
         p.error("maximum_rejected_train_fraction must be in [0, 1)")
+    if cfg["optimizer"] not in ("adamw_torch", "adamw_8bit"):
+        p.error("optimizer must be adamw_torch or adamw_8bit")
     return args, cfg
 
 
@@ -136,8 +140,8 @@ def find_data(cfg, work):
     if not archive.exists():
         temp = work / "dataset.partial.zip"
         LOG.info("Downloading supplied Drive archive")
-        result = gdown.download(url=cfg["download_url"], output=str(temp), fuzzy=True,
-                                quiet=False, resume=True)
+        result = retry_io(lambda: gdown.download(url=cfg["download_url"], output=str(temp), fuzzy=True,
+                                                     quiet=False, resume=True))
         if not result or not temp.is_file():
             raise RuntimeError("Drive download failed; check public access/quota or attach archive as Kaggle Dataset")
         import zipfile
@@ -229,14 +233,21 @@ def audit_retention(splits, manifests, problems, cfg):
     if not splits.get('train') or not splits.get('validation'):
         errors.append('Train and validation must retain at least one valid row')
     train = summary.get('train', {})
+    retention_issues = []
     if cfg['invalid_row_policy'] == 'skip':
         limit = cfg['maximum_rejected_train_fraction']
         for key in ('rejected_row_fraction', 'rejected_known_hour_fraction'):
             if train.get(key, 0) > limit:
-                errors.append(f'Training {key}={train[key]:.2%} exceeds configured {limit:.2%} limit')
+                retention_issues.append(f'Training {key}={train[key]:.2%} exceeds configured {limit:.2%} limit')
     if train.get('hours', 0) < cfg['minimum_train_hours']:
-        errors.append(f"Only {train.get('hours', 0):.2f} retained training hours; "
+        retention_issues.append(f"Only {train.get('hours', 0):.2f} retained training hours; "
                       f"minimum_train_hours={cfg['minimum_train_hours']}")
+    if cfg.get('enforce_retention_limits', True) or cfg['invalid_row_policy'] == 'strict':
+        errors.extend(retention_issues)
+    else:
+        train['retention_warnings'] = retention_issues
+        for issue in retention_issues:
+            LOG.warning('Retention warning; continuing under permissive policy: %s', issue)
     return summary, errors
 
 
@@ -359,7 +370,10 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
     from snac import SNAC
     from datasets import load_dataset
     cache.mkdir(parents=True, exist_ok=True)
-    store.restore_files("cache/" + cache_id, cache)
+    try:
+        store.restore_files("cache/" + cache_id, cache, skip_existing=True)
+    except RuntimeError as exc:
+        LOG.warning("Remote cache restore unavailable (%s); verified local chunks reused and missing chunks regenerated", type(exc).__name__)
     codec = None
     files, encoding_errors, accepted_audio = {}, [], {}
     try:
@@ -373,24 +387,34 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
                 path = folder / f"{start:07d}.parquet"
                 meta = path.with_suffix(".json")
                 chunk_identity = fingerprint(subset)
-                if path.exists() and meta.exists():
+                if valid_chunk(path, meta, chunk_identity, len(subset), pd.read_parquet):
                     info = read_json(meta)
-                    if info["row_identity"] != chunk_identity or info["sha256"] != sha256(path):
-                        raise RuntimeError(f"Stale/corrupt cache chunk: {path}")
-                    if len(pd.read_parquet(path)) != info["rows"] or info["rows"] + len(info.get("excluded", [])) != len(subset):
-                        raise RuntimeError(f"Incomplete cache chunk: {path}")
                 else:
+                    if path.exists() or meta.exists():
+                        LOG.warning("Rebuilding damaged/incomplete derived cache chunk: %s", path)
                     if codec is None:
-                        codec = SNAC.from_pretrained(CODEC_ID, revision=cfg["codec_revision"]).eval().cuda()
+                        codec = retry_io(lambda: SNAC.from_pretrained(CODEC_ID, revision=cfg["codec_revision"])).eval().cuda()
                     encoded, excluded = [], []
                     for row in subset:
-                        wav, sr = sf.read(root / row["audio"], dtype="float32")
-                        if sr != 24000:
-                            raise ValueError("Audio changed after validation")
-                        with torch.inference_mode():
-                            codes = codec.encode(torch.from_numpy(wav).cuda().view(1, 1, -1))
-                        c0, c1, c2 = [c[0].cpu().tolist() for c in codes]
-                        tokens = interleave_codes(c0, c1, c2, cfg["dedup"])
+                        try:
+                            wav, sr = sf.read(root / row["audio"], dtype="float32")
+                            if sr != 24000:
+                                raise ValueError("Audio changed after validation")
+                            with torch.inference_mode():
+                                codes = codec.encode(torch.from_numpy(wav).cuda().view(1, 1, -1))
+                            c0, c1, c2 = [c[0].cpu().tolist() for c in codes]
+                            tokens = interleave_codes(c0, c1, c2, cfg["dedup"])
+                        except (ValueError, OSError, RuntimeError) as exc:
+                            # Kernel/driver failures are global; do not mislabel all data as bad.
+                            oom = type(exc).__name__ == "OutOfMemoryError" or "out of memory" in str(exc).lower()
+                            row_error = isinstance(exc, (ValueError, OSError)) or type(exc).__name__.startswith('Libsndfile')
+                            if cfg["invalid_row_policy"] != "skip" or not (row_error or oom):
+                                raise
+                            excluded.append(dict(split=split, row=row["source_row"], audio=row["audio"],
+                                                 error=str(exc), duration_seconds=row["duration"], stage="encoding_audio_or_memory"))
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                            continue
                         try:
                             item = training_row(prompt_ids(tokenizer, row["text"], row["speaker"]),
                                                 tokens, cfg["objective"], cfg["max_length"], vocab_size)
@@ -464,10 +488,10 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     from transformers import Trainer, TrainingArguments, TrainerCallback
     from synthesize import generate_audio
 
-    model, loaded_tokenizer = FastLanguageModel.from_pretrained(
+    model, loaded_tokenizer = retry_io(lambda: FastLanguageModel.from_pretrained(
         model_name=cfg["model_id"], revision=cfg["model_revision"],
         use_exact_model_name=True, max_seq_length=cfg["max_length"], dtype=None,
-        load_in_4bit=cfg["precision"] == "4bit")
+        load_in_4bit=cfg["precision"] == "4bit"))
     if loaded_tokenizer.get_vocab() != tokenizer.get_vocab():
         raise RuntimeError("Preprocessing and training tokenizer vocabularies differ")
     model = FastLanguageModel.get_peft_model(
@@ -489,6 +513,51 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
         width = math.ceil(max(len(x["input_ids"]) for x in examples)/8)*8
         return {key: torch.tensor([list(x[key]) + [pad]*(width-len(x[key])) for x in examples], dtype=torch.long)
                 for key, pad in [("input_ids", SPECIAL["pad"]), ("attention_mask", 0), ("labels", -100)]}
+
+    previous = latest_checkpoint(run)
+    def probe_memory(row):
+        try:
+            # AdamW moments and step temporaries are allocated after the first real
+            # backward pass. Reserve their budget during the probe as well.
+            reserve = torch.empty(trainable * 12 + 64 * 1024**2, dtype=torch.uint8,
+                                  device=next(model.parameters()).device)
+            with torch.random.fork_rng(devices=[0]):
+                model.train()
+                batch = {k: v.to(next(model.parameters()).device) for k, v in collate([row] * cfg["micro_batch"]).items()}
+                dtype = torch.bfloat16 if is_bfloat16_supported() else torch.float16
+                for _ in range(min(cfg["grad_accum"], 2)):
+                    with torch.autocast(device_type="cuda", dtype=dtype):
+                        loss = model(**batch).loss
+                    if not torch.isfinite(loss).item():
+                        raise FloatingPointError("Nonfinite loss in model preflight")
+                    loss.backward()
+                torch.cuda.synchronize()
+        finally:
+            batch, loss, reserve = None, None, None
+            model.zero_grad(set_to_none=True)
+            gc.collect()
+            torch.cuda.empty_cache()
+    ds["train"], memory_exclusions = memory_selection(ds["train"], run, probe_memory,
+                                                      resuming=previous is not None)
+    retained = set(ds["train"]["audio"])
+    splits["train"] = [row for row in splits["train"] if row["audio"] in retained]
+    if not splits["train"]:
+        raise RuntimeError("No training rows remain after the GPU memory probe")
+    report = read_json(run / "dataset_report.json")
+    original_problems = read_json(run / "data_errors.json") + read_json(run / "encoding_errors.json")
+    inventory = {row['audio']: row for row in read_json(run / 'training_manifests.json')['train']}
+    memory_problems = [dict(split='train', duration_seconds=inventory[e['audio']]['duration'], **e)
+                       for e in memory_exclusions]
+    summary, failures = audit_retention(splits, report["manifests"], original_problems + memory_problems, cfg)
+    report.update(splits=summary, memory_excluded_rows=len(memory_problems), failure_reasons=failures)
+    atomic_json(run / "dataset_report.json", report)
+    for name in ("training_selection.json", "dataset_report.json"):
+        store.put(run / name, "preparation/" + name)
+    if failures:
+        raise ValueError('; '.join(failures))
+    atomic_json(run / "effective_training_manifests.json", splits)
+    store.put(run / "effective_training_manifests.json", "preparation/effective_training_manifests.json")
+    LOG.info("Model backward preflight passed; training rows=%d, optimizer=%s", len(ds["train"]), cfg["optimizer"])
 
     eval_ds = ds["validation"]
     if cfg["eval_samples"] and len(eval_ds) > cfg["eval_samples"]:
@@ -580,7 +649,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                                                   epoch=state.epoch, timestamp=time.time()))
             # First secure training state. Optional samples cannot delay the first upload.
             optional_plots(run)
-            store.backup(run, checkpoint)
+            uploaded = store.backup(run, checkpoint)
             self.samples(state)
             optional_plots(run)
             # The required training snapshot is already secured. Sample refresh is optional.
@@ -591,8 +660,18 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                             type(exc).__name__)
                 append_jsonl(run / "optional_errors.jsonl", dict(stage="sample_snapshot_refresh",
                                                                error=str(exc)))
-            LOG.info("Checkpoint %s safely archived%s", checkpoint.name,
-                     " to " + store.remote if store.remote else " locally")
+            LOG.info("Checkpoint %s verified locally; remote upload status: %s", checkpoint.name,
+                     "local only" if not store.remote else ("uploaded" if uploaded else "pending (see backup_status.json)"))
+
+    reporting = ["tensorboard"]
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=str(run / "tensorboard"))
+        writer.close()
+    except Exception as exc:
+        reporting = []
+        LOG.warning("Optional TensorBoard unavailable (%s); canonical JSONL metrics remain enabled", type(exc).__name__)
+        append_jsonl(run / "optional_errors.jsonl", dict(stage="tensorboard", error=type(exc).__name__))
 
     arguments = TrainingArguments(
         output_dir=str(run), num_train_epochs=1, max_steps=cfg["max_steps"],
@@ -600,19 +679,27 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
         gradient_accumulation_steps=cfg["grad_accum"], learning_rate=cfg["learning_rate"],
         warmup_ratio=cfg["warmup_ratio"], lr_scheduler_type=cfg["scheduler"],
         weight_decay=cfg["weight_decay"], max_grad_norm=1.0,
-        optim="adamw_8bit", fp16=not is_bfloat16_supported(), bf16=is_bfloat16_supported(),
+        optim=cfg["optimizer"], fp16=not is_bfloat16_supported(), bf16=is_bfloat16_supported(),
         eval_strategy="steps", eval_steps=cfg["eval_steps"], prediction_loss_only=True,
         save_strategy="steps", save_steps=cfg["save_steps"],
         save_total_limit=cfg["save_total_limit"], save_only_model=False,
         logging_steps=cfg["logging_steps"], logging_first_step=True, logging_nan_inf_filter=False,
-        report_to=["tensorboard"], logging_dir=str(run / "tensorboard"),
+        report_to=reporting, logging_dir=str(run / "tensorboard"),
         group_by_length=cfg["sampling"] == "length", length_column_name="length",
         dataloader_drop_last=False, dataloader_num_workers=0, dataloader_pin_memory=True,
         remove_unused_columns=False, seed=cfg["seed"], data_seed=cfg["seed"],
         ignore_data_skip=False, disable_tqdm=True, label_names=["labels"],
         load_best_model_at_end=False)
     monitor = Monitor()
-    trainer = Trainer(model=model, args=arguments, train_dataset=ds["train"],
+    class ResilientTrainer(Trainer):
+        def evaluate(self, *args, **kwargs):
+            def cleanup():
+                gc.collect()
+                torch.cuda.empty_cache()
+            return optional_evaluation(lambda: super(ResilientTrainer, self).evaluate(*args, **kwargs),
+                                       run, self.state.global_step, cleanup)
+
+    trainer = ResilientTrainer(model=model, args=arguments, train_dataset=ds["train"],
                       eval_dataset=eval_ds, data_collator=collate,
                       processing_class=tokenizer, callbacks=[monitor])
     previous = latest_checkpoint(run)
@@ -632,13 +719,13 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             store.backup(run, cp)
         LOG.info("Session ended safely. Rerun identical command/config to continue the SAME epoch")
         return
-    metrics = trainer.evaluate(eval_dataset=ds["validation"], metric_key_prefix="full_validation")
-    trainer.save_metrics("validation", metrics)
     final = run / "adapter_final"
     trainer.save_model(final)
     tokenizer.save_pretrained(final)
     atomic_json(final / "run_identity.json", identity)
     atomic_json(final / "resolved_config.json", cfg)
+    metrics = trainer.evaluate(eval_dataset=ds["validation"], metric_key_prefix="full_validation")
+    trainer.save_metrics("validation", metrics)
     atomic_json(run / "status.json", dict(status="smoke_complete" if cfg["max_steps"] > 0 else "complete",
                                           step=trainer.state.global_step, epoch=trainer.state.epoch,
                                           validation=metrics))
@@ -646,7 +733,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     cp = latest_checkpoint(run)
     if not cp:
         raise RuntimeError("No resumable final checkpoint was created")
-    store.backup(run, cp)
+    store.backup(run, cp, force=True)
     LOG.info("Finished; adapter at %s", final)
 
 
@@ -684,6 +771,7 @@ def main():
         except BlockingIOError:
             raise RuntimeError("Another process is using this run_id") from None
         with checkpoint_store(cfg) as store:
+            store = DeferredUploads(store, run)
             if args.mode == "storage-check":
                 LOG.info("Storage preflight passed; no dataset download or GPU training requested")
                 return
@@ -702,7 +790,10 @@ def main():
                            and previous_cfg.get(k) != v]
                 if changed:
                     raise RuntimeError(f"Completed run_id reused with different settings {changed}; choose a new run_id")
-                LOG.info("This run is already complete; use synthesize.py or a new run_id")
+                completed_checkpoint = latest_checkpoint(run)
+                if completed_checkpoint:
+                    store.backup(run, completed_checkpoint, force=True)
+                LOG.info("This run is already complete; pending remote backup retried. Use synthesize.py or a new run_id")
                 return
             handler = logging.FileHandler(run / "run.log", encoding="utf-8")
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
@@ -724,17 +815,17 @@ def main():
                     if cfg[k] in ("main", old[k]):
                         cfg[k] = old[k]
             api = HfApi()
-            cfg["model_revision"] = api.model_info(cfg["model_id"], revision=cfg["model_revision"]).sha
-            cfg["codec_revision"] = api.model_info(CODEC_ID, revision=cfg["codec_revision"]).sha
+            cfg["model_revision"] = retry_io(lambda: api.model_info(cfg["model_id"], revision=cfg["model_revision"])).sha
+            cfg["codec_revision"] = retry_io(lambda: api.model_info(CODEC_ID, revision=cfg["codec_revision"])).sha
             root = find_data(cfg, work)
             splits = audit_with_reports(root, cfg, run, store)
-            tokenizer = AutoTokenizer.from_pretrained(cfg["model_id"], revision=cfg["model_revision"])
-            model_config = AutoConfig.from_pretrained(cfg["model_id"], revision=cfg["model_revision"])
+            tokenizer = retry_io(lambda: AutoTokenizer.from_pretrained(cfg["model_id"], revision=cfg["model_revision"]))
+            model_config = retry_io(lambda: AutoConfig.from_pretrained(cfg["model_id"], revision=cfg["model_revision"]))
             vocab_hash = fingerprint(tokenizer.get_vocab())
             token_identity = dict(format_version=FORMAT_VERSION, model_id=cfg["model_id"],
                                   model_revision=cfg["model_revision"], tokenizer_sha256=vocab_hash,
                                   encoding_source_sha256={name: sha256(Path(__file__).parent / name) for name in
-                                                          ("finetune_aslp_50h.py", "orpheus_utils.py")},
+                                                          ("finetune_aslp_50h.py", "orpheus_utils.py", "pipeline_recovery.py")},
                                   encoding_packages={name: importlib.metadata.version(name) for name in
                                                      ("torch", "snac", "tokenizers", "soundfile", "numpy")},
                                   codec=CODEC_ID, codec_revision=cfg["codec_revision"],
@@ -749,7 +840,7 @@ def main():
             identity = dict(config=semantic, token_cache_sha256=cache_id,
                             packages=env["packages"], torch=env["torch"],
                             source_sha256={name: sha256(Path(__file__).parent / name) for name in
-                                           ("finetune_aslp_50h.py", "orpheus_utils.py", "synthesize.py")})
+                                           ("finetune_aslp_50h.py", "orpheus_utils.py", "synthesize.py", "pipeline_recovery.py")})
             identity_path = run / "run_identity.json"
             if identity_path.exists() and read_json(identity_path) != identity:
                 raise RuntimeError("Run data/config/code/dependencies changed. Use a new run_id or restore original versions from requirements-resolved.txt")
