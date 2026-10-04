@@ -1,0 +1,16 @@
+# Linux NVIDIA runtime only. See README: resolver and GPU smoke test required.
+# Transformers version follows the inspected upstream Orpheus notebook.
+unsloth
+transformers==4.57.6
+trl==0.22.2
+datasets>=3.4.1,<4
+snac>=1.2.1,<2
+soundfile>=0.13,<1
+numpy>=1.26,<3
+pandas>=2.2,<3
+pyarrow>=18
+gdown>=5.2,<6
+matplotlib>=3.9
+tensorboard>=2.18
+psutil>=6
+scipy>=1.13

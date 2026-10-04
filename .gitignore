@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+work/
+runs/
+data/
+*.zip
+*.tar.gz
+*.wav
+*.parquet
+*.safetensors
+*.pt
+*.bin
+*.log
+*rclone*.conf
+*credentials*.json
+.env
