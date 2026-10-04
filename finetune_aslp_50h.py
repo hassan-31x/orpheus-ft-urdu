@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 from orpheus_utils import (
-    AUDIO_BASE, CODEC_ID, FORMAT_VERSION, SPECIAL, DriveStore, append_jsonl,
+    AUDIO_BASE, CODEC_ID, FORMAT_VERSION, SPECIAL, DriveStore, HuggingFaceStore, SnapshotStore, append_jsonl,
     atomic_json, clean_text, contained, fingerprint, interleave_codes,
     latest_checkpoint, plot_logs, prompt_ids, read_json, safe_unzip,
     seal_checkpoint, sha256, training_row,
@@ -36,8 +36,10 @@ DEFAULTS = Path(__file__).parent / "configs/aslp50h.json"
 def cli():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", type=Path, default=DEFAULTS)
-    p.add_argument("--mode", choices=["all", "prepare", "train"], default="all")
-    p.add_argument("--local-only", action="store_true", help="Explicitly opt out of Drive durability")
+    p.add_argument("--mode", choices=["all", "prepare", "train", "storage-check"], default="all")
+    p.add_argument("--local-only", action="store_true", help="Explicitly opt out of remote checkpoint backups")
+    p.add_argument("--checkpoint-backend", choices=["huggingface", "drive", "local"])
+    p.add_argument("--hf-repo-id", help="Private Hugging Face model repo: USERNAME/REPOSITORY")
     for name in ["run-id", "work-dir", "data-dir", "train-manifest", "validation-manifest", "test-manifest"]:
         p.add_argument("--" + name)
     for name in ["micro-batch", "grad-accum", "rank", "seed", "max-length", "max-steps"]:
@@ -57,6 +59,14 @@ def cli():
         v = getattr(args, k, None)
         if v is not None:
             cfg[k] = v
+    if args.local_only:
+        cfg["checkpoint_backend"] = "local"
+    if cfg["checkpoint_backend"] not in ("huggingface", "drive", "local"):
+        p.error("checkpoint_backend must be huggingface, drive or local")
+    if cfg["checkpoint_backend"] == "huggingface":
+        cfg["hf_repo_id"] = cfg["hf_repo_id"] or os.environ.get("ORPHEUS_HF_REPO")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", cfg["hf_repo_id"] or ""):
+            p.error("Set hf_repo_id, --hf-repo-id or ORPHEUS_HF_REPO to USERNAME/REPOSITORY (see README)")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}", cfg["run_id"]):
         p.error("run_id must be a simple directory name")
     for k in ["micro_batch", "grad_accum", "rank", "max_length", "chunk_size", "save_steps",
@@ -81,10 +91,19 @@ def cli():
 
 
 @contextlib.contextmanager
-def drive_store(local_only, run_id):
-    if local_only:
+def checkpoint_store(cfg):
+    if cfg["checkpoint_backend"] == "local":
         LOG.warning("LOCAL ONLY: runtime deletion will lose work unless outputs are saved separately")
-        yield DriveStore()
+        yield SnapshotStore()
+        return
+    if cfg["checkpoint_backend"] == "huggingface":
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            raise RuntimeError("Set HF_TOKEN from Kaggle Secrets to a token with write access to your private checkpoint repo (see README)")
+        store = HuggingFaceStore(cfg["hf_repo_id"], cfg["run_id"], token)
+        store.preflight()
+        LOG.info("Checkpoint storage: %s", store.remote)
+        yield store
         return
     remote = os.environ.get("ORPHEUS_DRIVE_REMOTE", "gdrive:orpheus_urdu")
     encoded = os.environ.get("RCLONE_CONFIG_B64")
@@ -96,8 +115,9 @@ def drive_store(local_only, run_id):
             config = Path(tmp) / "rclone.conf"
             config.write_bytes(base64.b64decode(encoded, validate=True))
             config.chmod(0o600)
-        store = DriveStore(remote + "/" + run_id, config)
+        store = DriveStore(remote + "/" + cfg["run_id"], config)
         store.preflight()
+        LOG.info("Checkpoint storage: %s", store.remote)
         yield store
 
 
@@ -263,14 +283,7 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
     from snac import SNAC
     from datasets import load_dataset
     cache.mkdir(parents=True, exist_ok=True)
-    if store.remote:
-        # Remote cache starts existing after first encoded chunk; missing folder is normal.
-        folders = store.run("lsf", store.remote, "--dirs-only").splitlines()
-        if "cache/" in folders:
-            ids = store.run("lsf", store.remote + "/cache", "--dirs-only").splitlines()
-            if cache_id + "/" in ids:
-                store.run("copy", store.remote + "/cache/" + cache_id, cache,
-                          "--exclude", "*.tmp*")
+    store.restore_files("cache/" + cache_id, cache)
     codec = None
     files = {}
     try:
@@ -457,7 +470,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             # Refresh snapshot with samples; older remote snapshots remain recoverable.
             store.backup(run, checkpoint)
             LOG.info("Checkpoint %s safely archived%s", checkpoint.name,
-                     " to Drive" if store.remote else " locally")
+                     " to " + store.remote if store.remote else " locally")
 
     arguments = TrainingArguments(
         output_dir=str(run), num_train_epochs=1, max_steps=cfg["max_steps"],
@@ -533,14 +546,17 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError("Another process is using this run_id") from None
-        with drive_store(args.local_only, cfg["run_id"]) as store:
+        with checkpoint_store(cfg) as store:
+            if args.mode == "storage-check":
+                LOG.info("Storage preflight passed; no dataset download or GPU training requested")
+                return
             store.restore(run)
             status = run / "status.json"
             if status.exists() and read_json(status).get("status") in ("complete", "smoke_complete"):
                 previous_cfg = read_json(run / "resolved_config.json")
                 changed = [k for k, v in cfg.items() if k not in
-                           ("work_dir", "data_dir", "session_hours", "download_url", "model_revision", "codec_revision")
-                           and previous_cfg[k] != v]
+                           ("work_dir", "data_dir", "session_hours", "download_url", "model_revision", "codec_revision", "checkpoint_backend", "hf_repo_id")
+                           and previous_cfg.get(k) != v]
                 if changed:
                     raise RuntimeError(f"Completed run_id reused with different settings {changed}; choose a new run_id")
                 LOG.info("This run is already complete; use synthesize.py or a new run_id")
@@ -586,7 +602,7 @@ def main():
             env, freeze, gpu = environment(run)
             # Same code, dependency versions, sequence order, schedule, objective and batch geometry.
             semantic = {k: v for k, v in cfg.items() if k not in
-                        ("work_dir", "data_dir", "download_url", "train_manifest", "validation_manifest", "test_manifest", "session_hours")}
+                        ("work_dir", "data_dir", "download_url", "train_manifest", "validation_manifest", "test_manifest", "session_hours", "checkpoint_backend", "hf_repo_id")}
             identity = dict(config=semantic, token_cache_sha256=cache_id,
                             packages=env["packages"], torch=env["torch"],
                             source_sha256={name: sha256(Path(__file__).parent / name) for name in

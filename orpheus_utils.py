@@ -196,23 +196,10 @@ def latest_checkpoint(run):
     return None
 
 
-class DriveStore:
-    """rclone OAuth credentials live outside experiment artifacts. No remote deletes."""
-    def __init__(self, remote=None, config=None):
-        self.remote = remote.rstrip("/") if remote else None
-        self.config = config
-
-    def run(self, *args):
-        cmd = ["rclone"]
-        if self.config:
-            cmd += ["--config", str(self.config)]
-        cmd += ["--retries", "3", "--low-level-retries", "10", "--contimeout", "30s",
-                "--timeout", "5m", "--log-level", "ERROR", *map(str, args)]
-        # Do not print stderr: a backend error could include sensitive token/config fields.
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode:
-            raise RuntimeError(f"Drive operation {args[0]} failed (code {r.returncode}); check access/quota/network")
-        return r.stdout
+class SnapshotStore:
+    """Verified artifacts shared by local, Drive and Hugging Face storage."""
+    def __init__(self, remote=None):
+        self.remote = remote
 
     def preflight(self):
         if self.remote:
@@ -224,29 +211,45 @@ class DriveStore:
                 out = Path(d) / "readback.json"
                 self.get("connection_probe.json", out)
                 if sha256(probe) != sha256(out):
-                    raise RuntimeError("Drive probe checksum mismatch")
+                    raise RuntimeError("Remote storage probe checksum mismatch")
 
     def put(self, local, relative):
         if self.remote:
-            self.run("copyto", local, self.remote + "/" + relative)
+            raise NotImplementedError
 
     def get(self, relative, local):
-        Path(local).parent.mkdir(parents=True, exist_ok=True)
-        self.run("copyto", self.remote + "/" + relative, local)
+        raise NotImplementedError
 
     def names(self):
+        return []
+
+    def restore_files(self, prefix, destination, skip_existing=False):
+        """Restore a preparation folder or immutable cache without backend-specific calls."""
         if not self.remote:
-            return []
-        return self.run("lsf", self.remote, "--files-only").splitlines()
+            return
+        prefix = prefix.strip("/") + "/"
+        destination = Path(destination)
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in sorted(self.names()):
+            if not name.startswith(prefix) or ".tmp" in Path(name).name:
+                continue
+            local = contained(destination, name[len(prefix):])
+            if skip_existing and local.exists():
+                continue
+            local.parent.mkdir(parents=True, exist_ok=True)
+            temp = local.with_name(local.name + ".download.tmp")
+            try:
+                self.get(name, temp)
+                temp.replace(local)
+            finally:
+                temp.unlink(missing_ok=True)
 
     def restore(self, run):
         if not self.remote:
             return
         if "latest.json" not in self.names():
-            folders = self.run("lsf", self.remote, "--dirs-only").splitlines()
-            if "preparation/" in folders:
-                # Encoding may have been interrupted BEFORE any Trainer checkpoint existed.
-                self.run("copy", self.remote + "/preparation", run, "--ignore-existing")
+            # Encoding may have been interrupted BEFORE any Trainer checkpoint existed.
+            self.restore_files("preparation", run, skip_existing=True)
             return
         with tempfile.TemporaryDirectory(dir=Path(run).parent) as d:
             pointer = Path(d) / "latest.json"
@@ -255,7 +258,7 @@ class DriveStore:
             archive = Path(d) / "snapshot.tar.gz"
             self.get(info["archive"], archive)
             if sha256(archive) != info["sha256"]:
-                raise RuntimeError("Drive snapshot checksum mismatch")
+                raise RuntimeError("Remote snapshot checksum mismatch")
             staging = Path(d) / "staging"
             staging.mkdir()
             safe_untar(archive, staging)
@@ -286,13 +289,145 @@ class DriveStore:
                     t.add(p, arcname=p.name)
             digest = sha256(archive)
             remote_name = f"snapshots/{checkpoint.name}-{digest[:12]}.tar.gz"
-            self.put(archive, remote_name)
-            # rclone verifies transfers; pointer is published only AFTER archive succeeds.
             pointer = Path(d) / "latest.json"
             atomic_json(pointer, dict(archive=remote_name, sha256=digest,
                                       checkpoint=checkpoint.name,
                                       step=int(checkpoint.name.split("-")[-1])))
-            self.put(pointer, "latest.json")
+            self.publish_snapshot(archive, remote_name, pointer)
+
+    def publish_snapshot(self, archive, remote_name, pointer):
+        # Drive uploads the pointer only AFTER the immutable archive succeeds.
+        self.put(archive, remote_name)
+        self.put(pointer, "latest.json")
+
+
+class DriveStore(SnapshotStore):
+    """rclone OAuth credentials live outside experiment artifacts. No remote deletes."""
+    def __init__(self, remote=None, config=None):
+        super().__init__(remote.rstrip("/") if remote else None)
+        self.config = config
+
+    def run(self, *args):
+        cmd = ["rclone"]
+        if self.config:
+            cmd += ["--config", str(self.config)]
+        cmd += ["--retries", "3", "--low-level-retries", "10", "--contimeout", "30s",
+                "--timeout", "5m", "--log-level", "ERROR", *map(str, args)]
+        # Do not print stderr: a backend error could include sensitive token/config fields.
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"Drive operation {args[0]} failed (code {r.returncode}); check access/quota/network")
+        return r.stdout
+
+    def put(self, local, relative):
+        if self.remote:
+            self.run("copyto", local, self.remote + "/" + relative)
+
+    def get(self, relative, local):
+        Path(local).parent.mkdir(parents=True, exist_ok=True)
+        self.run("copyto", self.remote + "/" + relative, local)
+
+    def names(self):
+        if not self.remote:
+            return []
+        return self.run("lsf", self.remote, "--files-only", "--recursive").splitlines()
+
+    def restore_files(self, prefix, destination, skip_existing=False):
+        if self.remote and any(n.startswith(prefix.rstrip("/") + "/") for n in self.names()):
+            options = ["--ignore-existing"] if skip_existing else []
+            self.run("copy", self.remote + "/" + prefix.strip("/"), destination,
+                     "--exclude", "*.tmp*", *options)
+
+
+class HuggingFaceStore(SnapshotStore):
+    """Private Hub model repo; synchronous commits and bounded transfer retries.
+
+    Training snapshots and caches are stored under runs/<run_id>/. This is an
+    artifact repository, not a directly loadable push_to_hub model directory.
+    Dependencies are imported lazily so CPU tests/local/Drive do not need Hub auth.
+    """
+    def __init__(self, repo_id, run_id, token=None, *, api=None, download=None, commit_add=None):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo_id or ""):
+            raise ValueError("hf_repo_id must be USERNAME/REPOSITORY")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}", run_id):
+            raise ValueError("Invalid run_id")
+        if api is None or download is None or commit_add is None:
+            from huggingface_hub import HfApi, hf_hub_download, CommitOperationAdd
+            api = api if api is not None else HfApi(token=token)
+            download = download if download is not None else hf_hub_download
+            commit_add = commit_add if commit_add is not None else CommitOperationAdd
+        self.repo_id, self.prefix = repo_id, f"runs/{run_id}"
+        super().__init__(f"hf://{repo_id}/{self.prefix}")
+        self.api, self._download, self._commit_add = api, download, commit_add
+        self._token, self._files = token, None
+
+    def _call(self, operation, function, *, missing_ok=False, **kwargs):
+        for attempt in range(3):
+            try:
+                return function(**kwargs)
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if missing_ok and status == 404:
+                    return None
+                if status in (400, 401, 403, 404) or attempt == 2:
+                    # API exception strings/tracebacks may contain sensitive request fields.
+                    raise RuntimeError(f"Hugging Face {operation} failed; check HF_TOKEN write permission, repo access, storage quota and Internet") from None
+                time.sleep(2**attempt)
+
+    def _path(self, relative):
+        # Validate the remote artifact path as well as local extraction paths.
+        contained(Path("/tmp/orpheus-hub-paths"), relative)
+        return self.prefix + "/" + relative
+
+    def preflight(self):
+        info = self._call("repository inspection", self.api.repo_info,
+                          repo_id=self.repo_id, repo_type="model", missing_ok=True)
+        if info is None:
+            self._call("repository setup", self.api.create_repo, repo_id=self.repo_id,
+                       repo_type="model", private=True, exist_ok=True)
+            info = self._call("repository inspection", self.api.repo_info,
+                              repo_id=self.repo_id, repo_type="model")
+        if not info.private:
+            raise RuntimeError("Checkpoint repository must be private; choose a private repo or change its visibility on Hugging Face")
+        super().preflight()
+
+    def put(self, local, relative):
+        self._call("upload", self.api.upload_file, repo_id=self.repo_id, repo_type="model",
+                   path_or_fileobj=str(local), path_in_repo=self._path(relative),
+                   commit_message=f"Save {self.prefix}/{relative}", run_as_future=False)
+        if self._files is not None:
+            self._files.add(relative)
+
+    def get(self, relative, local):
+        import shutil
+        local = Path(local)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        # local_dir avoids retaining another whole archive in the global Hub cache.
+        # Download sidecar metadata and any credentials remain outside run artifacts.
+        with tempfile.TemporaryDirectory(dir=local.parent, prefix="hub-download-") as d:
+            downloaded = self._call("download", self._download, repo_id=self.repo_id,
+                                    repo_type="model", filename=self._path(relative),
+                                    token=self._token, local_dir=d)
+            shutil.copy2(downloaded, local)
+
+    def names(self):
+        if self._files is None:
+            files = self._call("file listing", self.api.list_repo_files,
+                               repo_id=self.repo_id, repo_type="model")
+            prefix = self.prefix + "/"
+            self._files = {p[len(prefix):] for p in files if p.startswith(prefix)}
+        return sorted(self._files)
+
+    def publish_snapshot(self, archive, remote_name, pointer):
+        # The archive and pointer become visible in one atomic Hub commit.
+        # create_commit returns only after uploading blobs and committing succeeds.
+        operations = [self._commit_add(path_in_repo=self._path(remote_name), path_or_fileobj=str(archive)),
+                      self._commit_add(path_in_repo=self._path("latest.json"), path_or_fileobj=str(pointer))]
+        self._call("checkpoint commit", self.api.create_commit, repo_id=self.repo_id,
+                   repo_type="model", operations=operations,
+                   commit_message=f"Checkpoint {self.prefix}: {remote_name}", run_as_future=False)
+        if self._files is not None:
+            self._files.update((remote_name, "latest.json"))
 
 
 def plot_logs(run):

@@ -5,6 +5,8 @@
   "codec_revision": "main",
   "download_url": "https://drive.google.com/file/d/1Xslte2s7PLzLCqBxDope2LQi4cmnfDJ7/view",
   "work_dir": "/kaggle/working/orpheus",
+  "checkpoint_backend": "huggingface",
+  "hf_repo_id": "hassan-31x/orpheus-urdu-checkpoints",
   "data_dir": null,
   "train_manifest": null,
   "validation_manifest": null,

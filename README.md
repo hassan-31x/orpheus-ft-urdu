@@ -1,6 +1,6 @@
 # Urdu Orpheus: ASLP language adaptation on Kaggle
 
-This repository adapts `unsloth/orpheus-3b-0.1-pretrained` to Urdu using every row of your supplied **training manifest**, for **one epoch**. It downloads your Drive ZIP, validates the paired audio/transcripts, encodes speech with SNAC, trains LoRA adapters, measures held-out loss, generates intermediate Urdu samples, and backs up resumable training state to your Google Drive.
+This repository adapts `unsloth/orpheus-3b-0.1-pretrained` to Urdu using every row of your supplied **training manifest**, for **one epoch**. It downloads your Drive ZIP, validates the paired audio/transcripts, encodes speech with SNAC, trains LoRA adapters, measures held-out loss, generates intermediate Urdu samples, and backs up resumable training state to a **private Hugging Face repository**. Google Drive/rclone remains an optional storage backend.
 
 The supplied URL is included in `configs/aslp50h.json`:
 
@@ -16,7 +16,7 @@ This is **stage 1: Urdu language adaptation**. Arbitrary labels such as “happy
 |---|---|
 | `finetune_aslp_50h.py` | Download, audit, cache, train, monitor, resume |
 | `configs/aslp50h.json` | Full initial experiment settings |
-| `orpheus_utils.py` | Token format, artifact verification, Drive persistence |
+| `orpheus_utils.py` | Token format, artifact verification, Hugging Face/Drive persistence |
 | `synthesize.py` | Single/batch inference from final or intermediate adapters |
 | `evaluate_asr.py` | Optional Urdu ASR WER/CER with bootstrap intervals |
 | `kaggle_run.ipynb` | Ready-to-import notebook; replace repository URL |
@@ -27,11 +27,11 @@ Your original `finetune_aslp_10h.py`, paper, and `resources.md` are unchanged. T
 
 Use a Linux NVIDIA GPU environment. Kaggle T4 with 4-bit loading is the conservative starting point. The script exposes one GPU with `CUDA_VISIBLE_DEVICES=0`; **two T4s do not combine into one 32GB device**. This is not a distributed-training script. 16-bit LoRA is a separate experiment for a device with adequate VRAM. A GPU label is not a guarantee that the chosen sequence length/microbatch fits.
 
-Enable **Internet**, choose an **NVIDIA GPU accelerator**, and check the runtime limit and remaining GPU allowance shown in your Kaggle account. Set `session_hours` to a budget **shorter than that displayed limit**, allowing preparation, notebook setup and uploads. The shipped `10.5` is an example budget, not a claim that every Kaggle session lasts that long. A full epoch may require several sessions.
+Enable **Internet**, choose an **NVIDIA GPU accelerator**, and check the runtime limit and remaining GPU allowance shown in your Kaggle account. Set `session_hours` to a budget **shorter than that displayed limit**, allowing preparation, notebook setup and uploads. The configured value is a user-selected budget, not a claim about Kaggle's session limit; the notebook uses `10.5` as an example to adjust. A full epoch may require several sessions.
 
 Check free disk space. 50 hours of 24kHz mono PCM16 audio is about 8.64GB before file overhead. You also need space for the compressed download, extracted audio, base weights, Arrow caches, three local resumable checkpoints, final adapter and a temporary snapshot archive. Actual use depends on clip lengths, model precision and optimizer state; provision several tens of GB and inspect `df -h /kaggle/working`.
 
-The complete GPU workflow has **not been run in this local macOS workspace**. The CPU tests pass, but Unsloth/CUDA installation, Drive authentication, ZIP contents and GPU training must be verified in your Kaggle smoke run. The public Drive page was inspected; the multi-GB ZIP was not downloaded here.
+The complete GPU workflow has **not been run in this local macOS workspace**. CPU tests exercise both storage backends, including mocked Hub upload/restore and failed-commit recovery; authenticated remote transfers, Unsloth/CUDA installation, ZIP contents and GPU training must be verified in your Kaggle smoke run. The public Drive page was inspected; the multi-GB ZIP was not downloaded here.
 
 ## 2. Put the code on GitHub
 
@@ -41,9 +41,40 @@ Do not upload audio, adapter weights, training outputs, OAuth configuration or a
 
 For reproducible runs, clone a fixed commit or tag rather than a moving branch. Record the commit in your research notes. The pipeline also hashes and saves the actual training source files.
 
-## 3. Authorize checkpoint storage in your own Google Drive
+## 3. Set up checkpoint storage: Hugging Face recommended
 
-The public download link grants no write access to your Drive. Kaggle does not support Colab's `drive.mount()` API. The pipeline uses **rclone + Google OAuth**, with the configuration stored as a Kaggle Secret.
+No rclone installation, Google OAuth client or Drive mount is needed for the default workflow. The **input dataset still downloads from your supplied Google Drive link**; checkpoint storage is independent of that download.
+
+1. Create/sign in to your [Hugging Face account](https://huggingface.co/join).
+2. Create a **private model repository**, for example `YOUR_USERNAME/orpheus-urdu-checkpoints`. This is an artifact store, so choose **Model**, not Dataset or Space. If it does not exist, the script can create it privately when your token permits creation. An existing public repository is rejected before any artifacts are uploaded.
+3. Create a [user access token](https://huggingface.co/docs/hub/security-tokens) with write access to that repository. A fine-grained token scoped to an existing repository is suitable; if you want the script to create the repository, the token must also allow that creation.
+4. In Kaggle **Add-ons → Secrets**, add **`HF_TOKEN`**, paste the token and grant the notebook access. Never put the token in a JSON configuration, GitHub, notebook output or shell command.
+5. Load the token into the environment and set the repository ID:
+
+   ```python
+   import os
+   from kaggle_secrets import UserSecretsClient
+   os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+   os.environ["ORPHEUS_HF_REPO"] = "YOUR_USERNAME/orpheus-urdu-checkpoints"
+   ```
+
+6. Use the default config (`checkpoint_backend="huggingface"`). Set `hf_repo_id` in your JSON, use `--hf-repo-id`, or leave it null and use `ORPHEUS_HF_REPO`. An explicit config/CLI repo ID takes precedence over the environment variable.
+7. Test authentication and read/write access **without downloading audio or loading a GPU model**:
+
+   ```bash
+   python finetune_aslp_50h.py --mode storage-check \
+     --hf-repo-id YOUR_USERNAME/orpheus-urdu-checkpoints
+   ```
+
+The script uploads and reads back a small probe, then exits for `storage-check`. Normal runs perform the same preflight before processing data. Private artifacts appear under `runs/<run_id>/` inside the repository. Neither the token nor a Hub login file is written into experiment artifacts. There is no need to run `huggingface-cli login` or enable Trainer's separate `push_to_hub` feature.
+
+Checkpoint uploads use synchronous [Hub upload/commit APIs](https://huggingface.co/docs/huggingface_hub/v0.36.0/en/guides/upload). A single commit publishes the complete snapshot archive and `latest.json` together. Restarts read the pointer, download the archive and verify its SHA-256 and checkpoint file hashes before resuming. Token-cache chunks and preparation metadata use the same private repository. Transient API failures are retried up to three attempts; authentication/permission errors stop immediately. A persistent failure leaves the previous committed checkpoint recoverable.
+
+Check your Hugging Face private-storage allowance before a long run. Snapshots contain **optimizer state as well as adapter weights**, and remote history is retained. Removing files from the visible tree may not immediately reclaim historical storage; consult [Hub storage guidance](https://huggingface.co/docs/hub/storage-limits). No particular free storage capacity is assumed by this project.
+
+### Optional: keep Google Drive/rclone storage
+
+Choose `--checkpoint-backend drive`, or set `checkpoint_backend="drive"` in your JSON, to use the original backend. Only this option needs the rclone setup below. The public download link grants no write access to your Drive. Kaggle does not support Colab's `drive.mount()` API. This backend uses **rclone + Google OAuth**, with the configuration stored as a Kaggle Secret.
 
 1. Install rclone on your own computer using [rclone's installation instructions](https://rclone.org/install/).
 2. Follow [Google Drive configuration](https://rclone.org/drive/) and [create your own OAuth client](https://rclone.org/drive/#making-your-own-client-id). Enable the Google Drive API, configure the consent screen and authorized account, and create an OAuth desktop client. Rclone currently recommends your own client because its shared client is being retired during 2026.
@@ -61,11 +92,11 @@ The public download link grants no write access to your Drive. Kaggle does not s
    ```
 
 7. In Kaggle, open **Add-ons → Secrets**, add **`RCLONE_CONFIG_B64`**, paste that value and grant the notebook access. Base64 is encoding, not encryption; keep the value private.
-8. The default storage root is `gdrive:orpheus_urdu/<run_id>`. You may set `ORPHEUS_DRIVE_REMOTE` to a different root in the notebook. Do not append `<run_id>` yourself; the script does that.
+8. For this backend, the default storage root is `gdrive:orpheus_urdu/<run_id>`. You may set `ORPHEUS_DRIVE_REMOTE` to a different root in the notebook. Do not append `<run_id>` yourself; the script does that. Install rclone in Kaggle with `apt-get update -qq` and `apt-get install -y -qq rclone` before running the script.
 
 The script writes and reads back a small probe before doing GPU work. Credentials are decoded into a temporary directory with restricted permissions and are not included in snapshots. Token refresh can update the temporary rclone config during a session; future sessions use the refresh token in your Kaggle Secret. If you revoke it, replace the secret after reauthorization.
 
-For deliberate testing without Drive, add `--local-only`. That explicitly disables remote protection: local `/kaggle/working` files alone are not a reliable resume strategy across deleted runtimes.
+For deliberate testing without either remote backend, add `--local-only` or select `--checkpoint-backend local`. That explicitly disables remote protection: local `/kaggle/working` files alone are not a reliable resume strategy across deleted runtimes.
 
 ## 4. Expected data layout
 
@@ -108,14 +139,15 @@ Before a long run, create a **separate smoke config**:
 import json
 from pathlib import Path
 cfg = json.loads(Path("/kaggle/working/urdu-orpheus/configs/aslp50h.json").read_text())
+cfg["hf_repo_id"] = "YOUR_USERNAME/orpheus-urdu-checkpoints"
 cfg.update(run_id="aslp50h-smoke", max_steps=2, save_steps=1,
            eval_steps=1, eval_samples=4, sample_count=1)
 Path("/kaggle/working/smoke.json").write_text(json.dumps(cfg, indent=2))
 ```
 
-Run with `--config /kaggle/working/smoke.json`. This intentionally prepares all supplied training data and then trains only two steps. It tests the real maximum-length data/cache, a training backward pass, checkpoint optimizer state, validation, sample decoding, and Drive upload. `smoke_complete` must not be reported as a full epoch.
+Run with `--config /kaggle/working/smoke.json`, supplying your repository ID in the config, CLI or environment. This intentionally prepares all supplied training data and then trains only two steps. It tests the real maximum-length data/cache, a training backward pass, checkpoint optimizer state, validation, sample decoding, and remote upload. `smoke_complete` must not be reported as a full epoch.
 
-To test resume, pause a longer smoke configuration before its step limit, confirm `latest.json` and snapshot exist in Drive, and rerun the same command in a fresh runtime. Do not change `max_steps` for that resume. The restored step should advance from the saved value rather than start at zero. A completed two-step smoke run simply exits on rerun; it does not exercise continuation by itself.
+To test resume, pause a longer smoke configuration before its step limit, confirm `latest.json` and the snapshot exist under `runs/<run_id>/` in your private Hub repo (or your chosen Drive folder), and rerun the same command in a fresh runtime. Do not change `max_steps` for that resume. The restored step should advance from the saved value rather than start at zero. A completed two-step smoke run simply exits on rerun; it does not exercise continuation by itself.
 
 ### First complete experiment
 
@@ -132,6 +164,7 @@ After verifying the smoke run, use `configs/aslp50h.json` with `max_steps=-1`. D
 | Schedule | cosine; 3% warmup |
 | Optimizer / decay / grad clip | 8-bit AdamW / `0.001` / `1.0` |
 | Seed / sampling | 3407 / seeded random without replacement |
+| Checkpoint storage | Private Hugging Face model repository; `HF_TOKEN` + repository ID |
 | Sequence limit | 2048; fail rather than truncate |
 | Loss | all sequence tokens; padding ignored |
 | Frame removal | none |
@@ -166,7 +199,20 @@ Local layout:
     ...
 ```
 
-Drive layout:
+Hugging Face layout (default):
+
+```text
+YOUR_USERNAME/orpheus-urdu-checkpoints  [private model repository]
+  runs/<run_id>/
+    preparation/
+    cache/<fingerprint>/
+    snapshots/checkpoint-100-<hash>.tar.gz
+    snapshots/checkpoint-200-<hash>.tar.gz
+    latest.json
+    connection_probe.json
+```
+
+Optional Drive layout:
 
 ```text
 orpheus_urdu/<run_id>/
@@ -178,27 +224,54 @@ orpheus_urdu/<run_id>/
   connection_probe.json
 ```
 
-1. Encoding commits each 100-row chunk locally, computes its checksum and copies it to Drive with its metadata. A restart validates and reuses completed chunks. A chunk whose metadata/upload was interrupted is recomputed or uploaded again.
+1. Encoding commits each 100-row chunk locally, computes its checksum and copies it to the selected private remote store with its metadata. A restart validates and reuses completed chunks. A chunk whose metadata/upload was interrupted is recomputed or uploaded again.
 2. Trainer checkpoints include adapter weights, optimizer, scheduler, mixed-precision state when applicable, RNG state, Trainer state and tokenizer. The script verifies required files, hashes the checkpoint files and writes `COMPLETE.json` only after saving finishes.
 3. A tar snapshot includes the current complete checkpoint and experiment evidence. It excludes other checkpoint directories, the local lock and the separate token cache.
-4. The snapshot is uploaded first. **Only after success** is `latest.json` updated. If upload fails, the process stops and the previous remote checkpoint stays the resume target. Retrying with the same local runtime can upload the newer complete local checkpoint after continuing.
+4. Hugging Face publishes the snapshot and `latest.json` in **one synchronous commit**. Drive uploads the immutable snapshot first and updates the pointer only after success. If upload/commit fails, the process stops and the previous remote checkpoint stays the resume target. Retrying with the same local runtime can upload the newer complete local checkpoint after continuing.
 5. Snapshot archive hashes and checkpoint file hashes are verified on restore. A newer verified local checkpoint wins over an older remote checkpoint. Incomplete local checkpoint directories without a completion marker are skipped. A checksum mismatch raises an error so corruption is investigated rather than quietly used.
 6. Periodic samples are generated after the first checkpoint upload, then an updated snapshot is uploaded with the samples. Training RNG state is restored after monitoring. Each checkpoint may therefore have two immutable remote snapshots.
-7. Local retention is bounded; remote snapshots are retained for research/recovery and are never automatically deleted. Budget Drive space for adapter **and optimizer** state at each saved step. Choose a larger `save_steps` after the smoke run if upload/storage cost is excessive, and archive/remove obsolete snapshots manually after verifying your retained recovery copies.
+7. Local retention is bounded; remote snapshots are retained for research/recovery and are never automatically deleted. Budget Hub/Drive space for adapter **and optimizer** state at each saved step. Choose a larger `save_steps` after the smoke run if upload/storage cost is excessive, and archive/remove obsolete snapshots manually after verifying your retained recovery copies. Hub repository history has its own storage implications.
 
 The script catches SIGTERM/SIGINT by asking Trainer to save and stop at the next optimizer boundary. The `session_hours` guard reserves 15 minutes within its budget for saving/samples/upload. This is best effort: a hard kill, out-of-memory error, session deletion or lost network cannot guarantee an emergency save. Recovery is bounded by the **last successfully uploaded** checkpoint and committed cache chunks. Set a shorter budget if uploads take longer than the reserve.
 
 On graceful session cutoff, `status.json` says `paused_for_resume`. Rerun the identical command/config in a fresh session, with the same repo commit, environment and secret. The process restores the latest remote snapshot, downloads/revalidates audio if necessary, restores cache, and passes the checkpoint to `Trainer.train(resume_from_checkpoint=...)`. It retains `num_train_epochs=1`; this continues the original epoch, not a new epoch. `ignore_data_skip=False` preserves the resume position.
 
-The cache identity includes normalized row ordering/audio hashes, model/codec revisions, token format, encoding source/package versions, objective, sequence limit and deduplication. The training identity additionally checks batch geometry, schedule, settings, key package versions and training source hashes. If you reinstall a newer stack, resume can be rejected. Restore the original package versions from `requirements-resolved.txt`, preferably the original Kaggle image as well. Do not change the identity file to bypass this check.
+The cache identity includes normalized row ordering/audio hashes, model/codec revisions, token format, encoding source/package versions, objective, sequence limit and deduplication. The training identity additionally checks batch geometry, schedule, settings, key package versions and training source hashes. Storage backend/repository selection is recorded in `resolved_config.json` but excluded from the mathematical training identity. If you reinstall a newer stack, resume can be rejected. Restore the original package versions from `requirements-resolved.txt`, preferably the original Kaggle image as well. Do not change the identity file to bypass this check.
 
-Do not run two separate Kaggle sessions with the same `run_id` concurrently; the local lock cannot coordinate different machines writing the same Drive pointer.
+Switching the storage setting alone does **not** copy old artifacts into the new remote. Use one repository/backend consistently for a run, or transfer its snapshots, pointer and cache before switching. Existing checkpoints created by an earlier project commit still require that original code/environment: this update changes source hashes, so it is intended for new runs. Use the earlier commit to finish any already-started study rather than bypassing its identity checks.
+
+Do not run two separate Kaggle sessions with the same `run_id` concurrently; the local lock cannot coordinate different machines writing the same remote pointer. Hub commits are atomic, but two writers can still overwrite each other's logical progress.
 
 ### Manual recovery and inspection
 
-If `latest.json` is inaccessible or points to a damaged archive, use rclone to inspect `snapshots/`, download a previous immutable archive and restore it **to a separate run working directory**. Inspect its `status.json`, `resolved_config.json`, `COMPLETE.json` and checksums before resuming. Preserve the corrupt copy for investigation. Never infer resumability from `adapter_model.safetensors` alone.
+If `latest.json` is inaccessible or points to a damaged archive, inspect `runs/<run_id>/snapshots/` in the private Hub repository (or `snapshots/` in Drive). Download a previous immutable archive and restore it **to a separate run working directory**. Hub commit history also retains earlier pointer versions. Inspect `status.json`, `resolved_config.json`, `COMPLETE.json` and checksums before resuming. Preserve the corrupt copy for investigation. Never infer resumability from `adapter_model.safetensors` alone.
 
-For ordinary inspection:
+For ordinary Hub inspection:
+
+```python
+import os
+from huggingface_hub import HfApi
+api = HfApi(token=os.environ["HF_TOKEN"])
+files = api.list_repo_files("YOUR_USERNAME/orpheus-urdu-checkpoints", repo_type="model")
+print("\n".join(p for p in files if p.startswith("runs/YOUR_RUN_ID/snapshots/")))
+```
+
+You can restore the latest run artifacts without loading a GPU model:
+
+```python
+from pathlib import Path
+from orpheus_utils import HuggingFaceStore
+store = HuggingFaceStore("YOUR_USERNAME/orpheus-urdu-checkpoints", "YOUR_RUN_ID",
+                        token=os.environ["HF_TOKEN"])
+store.preflight()
+run = Path("/kaggle/working/orpheus/runs/YOUR_RUN_ID")
+run.mkdir(parents=True, exist_ok=True)
+store.restore(run)
+```
+
+Snapshots are archives in an artifact repository. `PeftModel.from_pretrained("YOUR_USERNAME/orpheus-urdu-checkpoints")` will not load an adapter directly from its root. Restore the archive and pass the resulting local `adapter_final` or `checkpoint-N` directory to `synthesize.py`.
+
+For optional Drive inspection:
 
 ```bash
 rclone --config /YOUR/PRIVATE/rclone.conf lsf gdrive:orpheus_urdu/YOUR_RUN_ID
@@ -250,7 +323,18 @@ python evaluate_asr.py --manifest /kaggle/working/final_eval/generated.csv \
 
 The evaluator transcribes with a pinned resolved revision of Whisper-large-v3, saves raw/normalized reference and hypothesis per utterance, corpus and mean-utterance WER/CER, and 1,000 bootstrap resamples for 95% intervals. It loads the ASR model only after TTS training/inference has exited. Whisper mistakes in Urdu can inflate the scores; evaluate the original held-out human speech with the same ASR as a calibration baseline. Manually inspect substitutions and severe outliers. Measure human naturalness separately with blinded native-Urdu listening.
 
-These offline evaluation outputs are outside the training run and are **not automatically uploaded** by the Trainer callback. Copy the directories into your own research folder on Drive using your authorized rclone configuration or save them as Kaggle outputs.
+These offline evaluation outputs are outside the training run and are **not automatically uploaded** by the Trainer callback. Upload them explicitly to the same private Hub repository:
+
+```python
+import os
+from huggingface_hub import HfApi
+HfApi(token=os.environ["HF_TOKEN"]).upload_folder(
+    repo_id="YOUR_USERNAME/orpheus-urdu-checkpoints", repo_type="model",
+    folder_path="/kaggle/working/final_eval",
+    path_in_repo="research/YOUR_RUN_ID/final_eval")
+```
+
+Alternatively, copy them to Drive with the optional rclone backend or save them as Kaggle outputs.
 
 ## 8. Research artifacts
 
@@ -282,7 +366,9 @@ Final validation loss is token cross entropy for the configured objective. It is
 
 | Problem | Action |
 |---|---|
-| Drive preflight fails | Check notebook Secret access, OAuth expiry, remote name, Drive scope, quota and Internet. No GPU training begins before the probe succeeds. |
+| Hub preflight fails | Check `HF_TOKEN` Secret access, token write permission, repository ID/type, private visibility, storage allowance and Internet. Try `--mode storage-check` first. |
+| Missing Hub repo ID | Set `hf_repo_id`, `--hf-repo-id` or `ORPHEUS_HF_REPO` to `USERNAME/REPOSITORY`. |
+| Optional Drive preflight fails | Check notebook Secret access, OAuth expiry, remote name, Drive scope, quota and Internet. No GPU training begins before the probe succeeds. |
 | ZIP download fails | Check sharing and Drive download quota. Upload the extracted paired dataset as a private Kaggle Dataset and set `data_dir` to its `/kaggle/input/...` path. |
 | No manifests found | Inspect archive folder names; set explicit `data_dir` and filenames. |
 | Training hours below 40 | Inspect `dataset_report.json`; you may have selected the 10h archive. Change `minimum_train_hours` only for a deliberately smaller new experiment. |
@@ -290,7 +376,7 @@ Final validation loss is token cross entropy for the configured objective. It is
 | CUDA OOM | Microbatch already defaults to 1. Use a smaller rank/new run or a larger GPU. Reduce context only after reviewing the data. Avoid concurrent model loading. |
 | NaN/Inf training logs | Inspect data and gradients; reduce LR in a new run. Preserve evidence; do not relabel the resumed experiment. |
 | Resume identity differs | Restore the original code/config/environment or start a new `run_id`. Changing batch size during resume is intentionally rejected. |
-| Runtime ends unexpectedly | Restart with the same run ID; only the last successful Drive save is guaranteed. |
+| Runtime ends unexpectedly | Restart with the same repo/backend and run ID; only the last successfully committed remote checkpoint is recoverable. |
 | Voice changes between samples | This stage learns language from diverse speakers without speaker conditioning. Stable voice identity requires verified conditioning data. |
 | Emotion words are spoken aloud | Stage 1 does not train an arbitrary emotion-control interface. Use grounded emotion annotations in stage 2. |
 
@@ -325,8 +411,6 @@ subprocess.run(["git", "checkout", REPO_REF], cwd=REPO, check=True)
 import sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(REPO / "requirements-kaggle.txt")], check=True)
 subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
-subprocess.run(["apt-get", "update", "-qq"], check=True)
-subprocess.run(["apt-get", "install", "-y", "-qq", "rclone"], check=True)
 subprocess.run([sys.executable, "-c", "from unsloth import FastLanguageModel; import torch; from snac import SNAC; assert torch.cuda.is_available(); assert tuple(map(int, torch.__version__.split('+')[0].split('.')[:2])) >= (2,6); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"], check=True)
 subprocess.run(["df", "-h", "/kaggle/working"], check=True)
 ```
@@ -336,14 +420,17 @@ subprocess.run(["df", "-h", "/kaggle/working"], check=True)
 ```python
 import os, json
 from kaggle_secrets import UserSecretsClient
-os.environ["RCLONE_CONFIG_B64"] = UserSecretsClient().get_secret("RCLONE_CONFIG_B64")
-os.environ["ORPHEUS_DRIVE_REMOTE"] = "gdrive:orpheus_urdu"
+os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 cfg = json.loads((REPO / "configs/aslp50h.json").read_text())
+cfg["checkpoint_backend"] = "huggingface"
+cfg["hf_repo_id"] = "YOUR_USERNAME/orpheus-urdu-checkpoints"  # Private Model repo.
 cfg["session_hours"] = 10.5  # CHANGE to below the runtime limit displayed in your account.
 CONFIG = Path("/kaggle/working/run-config.json")
 CONFIG.write_text(json.dumps(cfg, indent=2))
 RUN = Path(cfg["work_dir"]) / "runs" / cfg["run_id"]
+subprocess.run([sys.executable, str(REPO / "finetune_aslp_50h.py"),
+                "--config", str(CONFIG), "--mode", "storage-check"], cwd=REPO, check=True)
 ```
 
 ### Cell 4A — recommended unattended saved run
@@ -354,7 +441,7 @@ subprocess.run([sys.executable, "-u", str(REPO / "finetune_aslp_50h.py"),
                 "--config", str(CONFIG)], cwd=REPO, check=True)
 ```
 
-Use Kaggle **Save Version → Save & Run All** (wording may vary with the UI). The committed notebook executes the cells as a background Kaggle job; the blocking training cell keeps the job alive while training. You can close your laptop after confirming the saved run has started. The job still has Kaggle runtime/quota limits. Enable the Secret for the notebook before saving the version. Turn off an unused interactive GPU session to avoid consuming a second allocation.
+Use Kaggle **Save Version → Save & Run All** (wording may vary with the UI). The committed notebook executes the cells as a background Kaggle job; the blocking training cell keeps the job alive while training. You can close your laptop after confirming the saved run has started. The job still has Kaggle runtime/quota limits. Enable the `HF_TOKEN` Secret for the notebook before saving the version. Turn off an unused interactive GPU session to avoid consuming a second allocation.
 
 Do **not** use a detached Popen cell in a committed notebook and let the notebook immediately finish: the environment may be torn down with its child process.
 
@@ -402,4 +489,4 @@ else:
     print("Saved for continuation; rerun the same config to finish the epoch.")
 ```
 
-For a later Kaggle session, rerun Cells 1–4A with the **same commit, run ID, config and package versions**. Automatic Drive restore handles continuation.
+For a later Kaggle session, rerun Cells 1–4A with the **same commit, private repository, run ID, config and package versions**. Automatic remote restore handles continuation. The default cells need only the `HF_TOKEN` secret; rclone and its OAuth setup are unnecessary unless you deliberately choose the Drive backend.

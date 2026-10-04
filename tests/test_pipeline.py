@@ -5,13 +5,65 @@ import tarfile
 import tempfile
 import unittest
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
-from orpheus_utils import (SPECIAL, DriveStore, atomic_json, clean_text, contained,
+from orpheus_utils import (SPECIAL, DriveStore, HuggingFaceStore, SnapshotStore, atomic_json, clean_text, contained,
                            decode_frames, fingerprint, interleave_codes, latest_checkpoint,
                            safe_unzip, safe_untar, seal_checkpoint, training_row, verify_checkpoint)
 from evaluate_asr import distance, normalize
+
+
+class HubError(Exception):
+    def __init__(self, status, message="simulated Hub failure"):
+        super().__init__(message)
+        self.response = SimpleNamespace(status_code=status)
+
+
+class FakeHub:
+    """In-memory Hub API double: synchronous commits are all-or-nothing."""
+    def __init__(self, private=None):
+        self.private = private
+        self.files = {}
+        self.commits = []
+        self.commit_failure = None
+        self.created = []
+
+    def create_repo(self, **kwargs):
+        self.created.append(kwargs)
+        if self.private is None:
+            self.private = kwargs["private"]
+
+    def repo_info(self, **kwargs):
+        if self.private is None:
+            raise HubError(404)
+        return SimpleNamespace(private=self.private)
+
+    def upload_file(self, **kwargs):
+        assert kwargs["repo_type"] == "model" and kwargs["run_as_future"] is False
+        self.files[kwargs["path_in_repo"]] = Path(kwargs["path_or_fileobj"]).read_bytes()
+
+    def create_commit(self, **kwargs):
+        if self.commit_failure:
+            raise self.commit_failure
+        assert kwargs["repo_type"] == "model" and kwargs["run_as_future"] is False
+        updates = {o.path_in_repo: Path(o.path_or_fileobj).read_bytes() for o in kwargs["operations"]}
+        self.files.update(updates)
+        self.commits.append(tuple(updates))
+
+    def list_repo_files(self, **kwargs):
+        return list(self.files)
+
+    def download(self, **kwargs):
+        dest = Path(kwargs["local_dir"]) / kwargs["filename"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(self.files[kwargs["filename"]])
+        return str(dest)
+
+    def store(self, run_id="experiment"):
+        return HuggingFaceStore("student/private-checkpoints", run_id, token="test-secret",
+                                api=self, download=self.download, commit_add=SimpleNamespace)
 
 
 def fake_checkpoint(path):
@@ -145,6 +197,146 @@ class ArtifactTests(unittest.TestCase):
                 store.restore(restored)
             self.assertTrue(verify_checkpoint(restored / "checkpoint-12"))
             self.assertEqual(json.loads((restored / "status.json").read_text())["status"], "checkpoint_saved")
+
+
+class HuggingFaceTests(unittest.TestCase):
+    def test_preflight_creates_private_repo_and_checks_read_write(self):
+        hub = FakeHub()
+        store = hub.store()
+        store.preflight()
+        self.assertTrue(hub.private)
+        self.assertTrue(hub.created[0]["private"])
+        self.assertIn("runs/experiment/connection_probe.json", hub.files)
+        self.assertEqual(store.names(), ["connection_probe.json"])
+
+    def test_public_repo_is_rejected_before_any_upload(self):
+        hub = FakeHub(private=False)
+        with self.assertRaisesRegex(RuntimeError, "must be private"):
+            hub.store().preflight()
+        self.assertEqual(hub.files, {})
+
+    def test_existing_private_repo_does_not_require_creation_permission(self):
+        hub = FakeHub(private=True)
+        hub.store().preflight()
+        self.assertEqual(hub.created, [])
+
+    def test_full_checkpoint_roundtrip_with_atomic_pointer(self):
+        hub = FakeHub(private=True)
+        store = hub.store()
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "original"
+            cp = fake_checkpoint(run / "checkpoint-12")
+            atomic_json(run / "status.json", {"status": "checkpoint_saved"})
+            store.backup(run, cp)
+            self.assertEqual(len(hub.commits), 1)
+            self.assertEqual(len(hub.commits[0]), 2)
+            self.assertIn("runs/experiment/latest.json", hub.commits[0])
+            restored = Path(d) / "restored"
+            restored.mkdir()
+            # New client/session must list and download the remote files.
+            hub.store().restore(restored)
+            self.assertTrue(verify_checkpoint(restored / "checkpoint-12"))
+            self.assertEqual((restored / "checkpoint-12/optimizer.pt").read_bytes(), b"optimizer.pt")
+            self.assertNotIn(b"test-secret", next(v for k, v in hub.files.items() if k.endswith(".tar.gz")))
+
+    def test_failed_checkpoint_commit_preserves_previous_pointer(self):
+        hub = FakeHub(private=True)
+        store = hub.store()
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            store.backup(run, fake_checkpoint(run / "checkpoint-10"))
+            previous = dict(hub.files)
+            hub.commit_failure = HubError(403, "token test-secret must never be logged")
+            with self.assertRaises(RuntimeError) as error:
+                store.backup(run, fake_checkpoint(run / "checkpoint-20"))
+            self.assertEqual(hub.files, previous)
+            self.assertNotIn("test-secret", str(error.exception))
+
+    def test_corrupted_remote_snapshot_is_rejected(self):
+        hub = FakeHub(private=True)
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            hub.store().backup(run, fake_checkpoint(run / "checkpoint-10"))
+            archive = next(k for k in hub.files if k.endswith(".tar.gz"))
+            hub.files[archive] = b"broken archive"
+            restored = Path(d) / "restored"
+            restored.mkdir()
+            with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
+                hub.store().restore(restored)
+            self.assertFalse((restored / "checkpoint-10").exists())
+
+    def test_preparation_and_cache_restore_are_scoped_to_run(self):
+        hub = FakeHub(private=True)
+        hub.files.update({"runs/experiment/preparation/resolved_config.json": b'{"seed":3407}',
+                          "runs/experiment/cache/abc/train/0000000.parquet": b"tokens",
+                          "runs/other/preparation/resolved_config.json": b'{"seed":42}'})
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            run.mkdir()
+            hub.store().restore(run)
+            self.assertEqual(json.loads((run / "resolved_config.json").read_text())["seed"], 3407)
+            (run / "resolved_config.json").write_text('{"seed":123}')
+            hub.store().restore(run)
+            self.assertEqual(json.loads((run / "resolved_config.json").read_text())["seed"], 123)
+            cache = Path(d) / "cache"
+            hub.store().restore_files("cache/abc", cache)
+            self.assertEqual((cache / "train/0000000.parquet").read_bytes(), b"tokens")
+
+    def test_transient_errors_retry_but_auth_errors_stop(self):
+        from unittest.mock import Mock
+        store = FakeHub(private=True).store()
+        call = Mock(side_effect=[HubError(503), HubError(503), "ok"])
+        with patch("orpheus_utils.time.sleep") as sleep:
+            self.assertEqual(store._call("test", call), "ok")
+            self.assertEqual(sleep.call_count, 2)
+        call = Mock(side_effect=HubError(401))
+        with patch("orpheus_utils.time.sleep") as sleep:
+            with self.assertRaises(RuntimeError):
+                store._call("test", call)
+            sleep.assert_not_called()
+
+
+class StorageSelectionTests(unittest.TestCase):
+    def test_local_only_does_not_require_any_credentials(self):
+        from finetune_aslp_50h import checkpoint_store
+        with patch.dict("os.environ", {}, clear=True):
+            with checkpoint_store({"checkpoint_backend": "local"}) as store:
+                self.assertIsInstance(store, SnapshotStore)
+                self.assertIsNone(store.remote)
+
+    def test_hub_requires_secret(self):
+        from finetune_aslp_50h import checkpoint_store
+        with patch.dict("os.environ", {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "HF_TOKEN"):
+                with checkpoint_store({"checkpoint_backend": "huggingface"}):
+                    pass
+
+    def test_cli_storage_overrides(self):
+        from finetune_aslp_50h import cli
+        with patch("sys.argv", ["train", "--hf-repo-id", "student/checkpoints"]), patch.dict("os.environ", {}, clear=True):
+            _, cfg = cli()
+            self.assertEqual(cfg["checkpoint_backend"], "huggingface")
+            self.assertEqual(cfg["hf_repo_id"], "student/checkpoints")
+        with patch("sys.argv", ["train", "--local-only"]), patch.dict("os.environ", {}, clear=True):
+            _, cfg = cli()
+            self.assertEqual(cfg["checkpoint_backend"], "local")
+        with patch("sys.argv", ["train", "--checkpoint-backend", "drive"]), patch.dict("os.environ", {}, clear=True):
+            _, cfg = cli()
+            self.assertEqual(cfg["checkpoint_backend"], "drive")
+
+    def test_storage_check_exits_before_gpu_or_data_processing(self):
+        from finetune_aslp_50h import main
+        hub = FakeHub(private=True)
+        with tempfile.TemporaryDirectory() as d:
+            args = ["train", "--mode", "storage-check", "--work-dir", d,
+                    "--hf-repo-id", "student/private-checkpoints"]
+            with patch("sys.argv", args), patch.dict("os.environ", {"HF_TOKEN": "test-secret"}, clear=True), \
+                    patch.dict("sys.modules", {"unsloth": None, "torch": None}), \
+                    patch("finetune_aslp_50h.HuggingFaceStore", return_value=hub.store()), \
+                    patch("finetune_aslp_50h.find_data") as find_data:
+                main()
+                find_data.assert_not_called()
+            self.assertIn("runs/experiment/connection_probe.json", hub.files)
 
 
 if __name__ == "__main__":
