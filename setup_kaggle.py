@@ -1,6 +1,7 @@
 """Install into a dedicated venv without changing Kaggle's notebook packages."""
 import argparse
 import importlib.metadata as metadata
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -22,6 +23,21 @@ def cuda_constraints(version=metadata.version):
     return constraints
 
 
+def create_environment(target, evidence):
+    """Prefer stdlib venv; Debian images may lack the ensurepip component."""
+    try:
+        venv.EnvBuilder(system_site_packages=True, with_pip=True).create(target)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f'Stdlib venv unavailable ({type(exc).__name__}); using virtualenv', flush=True)
+        bootstrap = evidence / 'bootstrap'
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '--target', str(bootstrap),
+                        'virtualenv>=20.26,<21'], check=True)
+        env = os.environ.copy()
+        env['PYTHONPATH'] = str(bootstrap)
+        subprocess.run([sys.executable, '-m', 'virtualenv', '--system-site-packages',
+                        str(target)], env=env, check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--venv', type=Path, default=Path('/kaggle/working/orpheus-env'))
@@ -39,7 +55,7 @@ def main():
     evidence.mkdir(parents=True, exist_ok=True)
     constraints = evidence / 'cuda-constraints.txt'
     constraints.write_text('\n'.join(locked) + '\n')
-    venv.EnvBuilder(system_site_packages=True, with_pip=True).create(target)
+    create_environment(target, evidence)
     python = str(target / 'bin' / 'python')
     command = [python, '-m', 'pip', 'install', '--upgrade', '--upgrade-strategy',
                'only-if-needed', '--constraint', str(constraints), '--report',

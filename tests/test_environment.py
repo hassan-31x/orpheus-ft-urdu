@@ -5,10 +5,13 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import subprocess
+import tempfile
+from unittest.mock import patch
 
 from packaging.requirements import Requirement
 from check_environment import check_dependencies
-from setup_kaggle import cuda_constraints
+from setup_kaggle import cuda_constraints, create_environment
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -60,6 +63,43 @@ class EnvironmentTests(unittest.TestCase):
             raise metadata.PackageNotFoundError(name)
         with self.assertRaises(RuntimeError):
             cuda_constraints(version)
+
+    def test_venv_creation_uses_inherited_cuda_packages(self):
+        with patch('setup_kaggle.venv.EnvBuilder') as builder:
+            create_environment(Path('/tmp/env'), Path('/tmp/evidence'))
+        builder.assert_called_once_with(system_site_packages=True, with_pip=True)
+        builder.return_value.create.assert_called_once_with(Path('/tmp/env'))
+
+    def test_missing_ensurepip_uses_separate_virtualenv_bootstrap(self):
+        with patch('setup_kaggle.venv.EnvBuilder') as builder, patch('setup_kaggle.subprocess.run') as run:
+            builder.return_value.create.side_effect = subprocess.CalledProcessError(1, 'ensurepip')
+            create_environment(Path('/tmp/env'), Path('/tmp/evidence'))
+        self.assertEqual(run.call_count, 2)
+        self.assertIn('--target', run.call_args_list[0].args[0])
+        self.assertIn('--system-site-packages', run.call_args_list[1].args[0])
+        self.assertEqual(run.call_args_list[1].kwargs['env']['PYTHONPATH'], '/tmp/evidence/bootstrap')
+
+    def test_fresh_notebook_installs_before_using_training_python(self):
+        notebook = json.loads(Path('kaggle_run.ipynb').read_text())
+        source = ''.join(notebook['cells'][4]['source'])
+        with tempfile.TemporaryDirectory() as directory:
+            # Simulate a fresh runtime: no training Python has been installed yet.
+            scope = {'Path': Path, 'REPO': Path(directory),
+                     'sys': SimpleNamespace(executable='/host/python'), 'subprocess': subprocess}
+            def simulate(command, **kwargs):
+                if 'setup_kaggle.py' in str(command):
+                    target = scope['ENV'] / 'bin' / 'python'
+                    self.assertFalse(target.exists())
+                    target.parent.mkdir(parents=True)
+                    target.touch()
+                return SimpleNamespace(returncode=0)
+            with patch('subprocess.run', side_effect=simulate) as run:
+                # Substitute only the environment destination for the test filesystem.
+                exec(source.replace('/kaggle/working/orpheus-env', directory + '/env'), scope)
+            first = run.call_args_list[0].args[0]
+            self.assertEqual(first[0], '/host/python')
+            self.assertIn('--gpu', first)
+            self.assertIn('setup_kaggle.py', str(first))
 
     def test_notebook_uses_training_interpreter(self):
         notebook = json.loads(Path('kaggle_run.ipynb').read_text())

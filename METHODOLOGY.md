@@ -278,3 +278,5 @@ Useful citation starters; verify final formatting against the venue's requiremen
 ```
 
 Also cite Orpheus, Unsloth, SNAC, LoRA/QLoRA and the ASR evaluator using their original papers or repository citation metadata. Dataset licenses and original corpus attributions apply independently of this training code.
+
+The saved Kaggle notebook always executes installation before GPU imports, since a committed job cannot rely on packages installed in a prior interactive session. All training/storage/inference subprocesses use the generated venv interpreter. Repository checkout fetches the requested ref even when the clone exists; record the printed commit and pin it for resume. A stdlib venv failure falls back to virtualenv in a separate bootstrap directory.

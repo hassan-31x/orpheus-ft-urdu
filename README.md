@@ -131,17 +131,19 @@ Default speaker prompting is disabled because the trial identified unreliable sp
 
 ## 5. Configure and verify the Kaggle environment
 
-Use the notebook cells at the end of this guide, or import `kaggle_run.ipynb`. Replace the repository URL first.
+Use the notebook cells at the end of this guide, or import `kaggle_run.ipynb`. The notebook already contains this project’s GitHub URL. Edit `HF_REPO_ID` and `SESSION_HOURS` in Cell 1 first.
 
 Start a **fresh Kaggle session** after updating the repository, since the earlier setup changed the shared notebook packages. Replace the old installation cell with Cell 2 below (or import the updated notebook). Do not keep the old global `pip check` cell.
 
 `setup_kaggle.py` creates `/kaggle/working/orpheus-env` with its own pip and project packages. It inherits Kaggle's existing CUDA wheels using [venv's system-site-packages option](https://docs.python.org/3/library/venv.html). Installation goes into the venv and does not change the notebook kernel, Papermill, or Jupyter. This is isolation of installations, with shared base package visibility; it does not hide every preinstalled library.
 
+If the image lacks stdlib venv/ensurepip, setup falls back to virtualenv installed in a bootstrap directory. It does not install virtualenv into the notebook kernel.
+
 Torch, torchvision, torchaudio, Triton and xformers are constrained to their installed versions. An incompatible resolver result fails instead of replacing the CUDA stack or downloading a second Torch version. Requirements pin Unsloth, Transformers, TRL and Datasets; the remaining resolved versions are recorded. The project reads local Parquet and audio files and does not need `gcsfs`, `s3fs`, MoviePy, BigFrames, Pathos, TPOT, Colab, Dopamine or Gradio.
 
 A global `pip check` reports conflicts for all installed tools, including unrelated Kaggle packages. `check_environment.py` instead checks **every active dependency reachable from this project's requirements**, including transitive version constraints and activated extras. Missing or incompatible project dependencies still fail the cell. CPU smoke checks exercise Urdu Parquet and WAV round trips; `--gpu` checks Unsloth, Trainer, SNAC and bitsandbytes imports plus an xformers CUDA attention backward pass. This does not replace the two-step model/checkpoint test below.
 
-To avoid spending GPU quota on dependency installation, use **GPU off** and run Cell 1, then the installation subprocess in Cell 2. Leave the `--gpu` subprocess for after enabling the GPU. A restarted Kaggle session may discard the venv; rerun setup on the actual GPU image, since CPU and GPU images can differ. `TRAIN_PYTHON` must be used for storage checks, training and inference; the notebook kernel remains on its original interpreter. No kernel restart is needed just to use the venv.
+To check installation without a GPU, run the Cell 2 setup command with `--gpu` omitted. Restore `--gpu` before a saved training run. A restarted Kaggle session may discard the venv; rerun setup on the actual GPU image, since CPU and GPU images can differ. `TRAIN_PYTHON` must be used for storage checks, training and inference; the notebook kernel remains on its original interpreter. No kernel restart is needed just to use the venv. **Saved runs start fresh: keep installation in Cell 2 every time. An import-only replacement fails with `No module named unsloth`.** Updating the GitHub repository does not replace cells already copied into Kaggle; import the updated notebook itself.
 
 Setup evidence is saved alongside the venv in `/kaggle/working/orpheus-env-setup/`: `installation.log`, `installation.json`, `cuda-constraints.txt`, `resolved-requirements.txt`, `cpu-check.json`, and `gpu-check.json`. Keep these with your experiment output. A failed check reports its actual project dependencies or import/kernel error; inspect that report before starting training. The local CPU regression tests do not prove compatibility with every Kaggle GPU image. Use Torch 2.6+ for resumable optimizer/RNG loading.
 
@@ -408,42 +410,57 @@ These are the runnable setup cells requested for the workflow. You can also impo
 ### Cell 1 — clone a fixed version
 
 ```python
-import subprocess
+import os, sys, subprocess
 from pathlib import Path
-REPO_URL = "https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git"
-REPO_REF = "main"  # Prefer a fixed tag/commit before starting the real study.
+
+REPO_URL = "https://github.com/hassan-31x/orpheus-ft-urdu.git"
+REPO_REF = "main"  # Use the same fixed commit for an experiment and its resumes.
+HF_REPO_ID = "YOUR_USERNAME/orpheus-urdu-checkpoints"  # EDIT THIS.
+SESSION_HOURS = 10.5  # Set below the limit displayed in your Kaggle account.
 REPO = Path("/kaggle/working/urdu-orpheus")
+
+if "YOUR_USERNAME" in HF_REPO_ID or "/" not in HF_REPO_ID:
+    raise ValueError("Set HF_REPO_ID to your private Hugging Face model repository first")
+from kaggle_secrets import UserSecretsClient
+try:
+    os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
+except Exception:
+    raise RuntimeError("Add the HF_TOKEN Kaggle Secret and enable access for this notebook") from None
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["PYTHONNOUSERSITE"] = "1"
+
 if not REPO.exists():
     subprocess.run(["git", "clone", REPO_URL, str(REPO)], check=True)
-subprocess.run(["git", "checkout", REPO_REF], cwd=REPO, check=True)
+# Fetch even when the directory already exists; checkout alone leaves old code.
+subprocess.run(["git", "fetch", "origin", REPO_REF], cwd=REPO, check=True)
+subprocess.run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=REPO, check=True)
+for name in ("setup_kaggle.py", "check_environment.py", "requirements-kaggle.txt"):
+    if not (REPO / name).is_file():
+        raise RuntimeError(f"Repository version lacks {name}. Upload the updated project before running.")
+print("Project commit:", subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip())
 ```
 
 ### Cell 2 — install and preflight
 
 ```python
-import sys
+# Always install in this runtime: saved Kaggle jobs start with a fresh environment.
 ENV = Path("/kaggle/working/orpheus-env")
 TRAIN_PYTHON = str(ENV / "bin" / "python")
-# Installation and dependency/audio/Parquet checks work without a GPU.
-subprocess.run([sys.executable, str(REPO / "setup_kaggle.py"),
-                "--venv", str(ENV)], check=True)
-# Enable GPU for this check and subsequent training cells.
-subprocess.run([TRAIN_PYTHON, str(REPO / "check_environment.py"), "--gpu",
-                "--report", "/kaggle/working/orpheus-env-setup/gpu-check.json"], check=True)
+subprocess.run([sys.executable, "-u", str(REPO / "setup_kaggle.py"),
+                "--venv", str(ENV), "--gpu"], cwd=REPO, check=True)
+assert Path(TRAIN_PYTHON).is_file(), "Training environment was not created"
+print("All training subprocesses will use:", TRAIN_PYTHON)
 subprocess.run(["df", "-h", "/kaggle/working"], check=True)
 ```
 
 ### Cell 3 — private credentials and config
 
 ```python
-import os, json
-from kaggle_secrets import UserSecretsClient
-os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+import json
 cfg = json.loads((REPO / "configs/aslp50h.json").read_text())
 cfg["checkpoint_backend"] = "huggingface"
-cfg["hf_repo_id"] = "YOUR_USERNAME/orpheus-urdu-checkpoints"  # Private Model repo.
-cfg["session_hours"] = 10.5  # CHANGE to below the runtime limit displayed in your account.
+cfg["hf_repo_id"] = HF_REPO_ID
+cfg["session_hours"] = SESSION_HOURS
 CONFIG = Path("/kaggle/working/run-config.json")
 CONFIG.write_text(json.dumps(cfg, indent=2))
 RUN = Path(cfg["work_dir"]) / "runs" / cfg["run_id"]
