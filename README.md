@@ -19,7 +19,7 @@ This is **stage 1: Urdu language adaptation**. Arbitrary labels such as “happy
 | `orpheus_utils.py` | Token format, artifact verification, Hugging Face/Drive persistence |
 | `synthesize.py` | Single/batch inference from final or intermediate adapters |
 | `evaluate_asr.py` | Optional Urdu ASR WER/CER with bootstrap intervals |
-| `kaggle_run.ipynb` | Ready-to-import notebook; replace repository URL |
+| `kaggle_run.ipynb` | Ready-to-import notebook; edit checkpoint repository and session budget |
 | `setup_kaggle.py` | Dedicated training environment; preserves the installed CUDA stack |
 | `check_environment.py` | Project dependency validation and CPU/CUDA smoke checks |
 | `METHODOLOGY.md` | Research review, exact choices, ablations, evaluation limitations |
@@ -416,6 +416,7 @@ from pathlib import Path
 REPO_URL = "https://github.com/hassan-31x/orpheus-ft-urdu.git"
 REPO_REF = "main"  # Use the same fixed commit for an experiment and its resumes.
 HF_REPO_ID = "YOUR_USERNAME/orpheus-urdu-checkpoints"  # EDIT THIS.
+AUDIT_ONLY = False  # Set True with GPU OFF to inspect data before training.
 SESSION_HOURS = 10.5  # Set below the limit displayed in your Kaggle account.
 REPO = Path("/kaggle/working/urdu-orpheus")
 
@@ -446,8 +447,10 @@ print("Project commit:", subprocess.check_output(["git", "rev-parse", "HEAD"], c
 # Always install in this runtime: saved Kaggle jobs start with a fresh environment.
 ENV = Path("/kaggle/working/orpheus-env")
 TRAIN_PYTHON = str(ENV / "bin" / "python")
-subprocess.run([sys.executable, "-u", str(REPO / "setup_kaggle.py"),
-                "--venv", str(ENV), "--gpu"], cwd=REPO, check=True)
+setup_command = [sys.executable, "-u", str(REPO / "setup_kaggle.py"), "--venv", str(ENV)]
+if not AUDIT_ONLY:
+    setup_command.append("--gpu")
+subprocess.run(setup_command, cwd=REPO, check=True)
 assert Path(TRAIN_PYTHON).is_file(), "Training environment was not created"
 print("All training subprocesses will use:", TRAIN_PYTHON)
 subprocess.run(["df", "-h", "/kaggle/working"], check=True)
@@ -471,9 +474,21 @@ subprocess.run([TRAIN_PYTHON, str(REPO / "finetune_aslp_50h.py"),
 ### Cell 4A — recommended unattended saved run
 
 ```python
-# Blocks the notebook until training finishes or gracefully checkpoints for resume.
-subprocess.run([TRAIN_PYTHON, "-u", str(REPO / "finetune_aslp_50h.py"),
-                "--config", str(CONFIG)], cwd=REPO, check=True)
+# Blocks until the audit/training process completes. Failures print diagnostics.
+command = [TRAIN_PYTHON, "-u", str(REPO / "finetune_aslp_50h.py"), "--config", str(CONFIG)]
+if AUDIT_ONLY:
+    command += ["--mode", "audit"]
+try:
+    subprocess.run(command, cwd=REPO, check=True)
+except subprocess.CalledProcessError:
+    for name in ("data_error_summary.json", "data_errors.json"):
+        path = RUN / name
+        if path.exists():
+            value = json.loads(path.read_text())
+            print("Diagnostic file:", path)
+            print(json.dumps(value if isinstance(value, dict) else value[:10], indent=2, ensure_ascii=False))
+    print("The subprocess stopped. Training does not restart automatically; inspect the error before rerunning.")
+    raise
 ```
 
 Use Kaggle **Save Version → Save & Run All** (wording may vary with the UI). The committed notebook executes the cells as a background Kaggle job; the blocking training cell keeps the job alive while training. You can close your laptop after confirming the saved run has started. The job still has Kaggle runtime/quota limits. Enable the `HF_TOKEN` Secret for the notebook before saving the version. Turn off an unused interactive GPU session to avoid consuming a second allocation.
@@ -501,7 +516,7 @@ This detaches the process from the cell; it does not remove session inactivity/r
 ```python
 from IPython.display import Audio, display
 status = RUN / "status.json"
-print(json.loads(status.read_text()) if status.exists() else "Preparing dataset/cache")
+print(json.loads(status.read_text()) if status.exists() else ("Dataset audit only; no training started" if AUDIT_ONLY else "No training status recorded"))
 for path in sorted((RUN / "samples").glob("step-*/*.wav"))[-3:]:
     print(path)
     display(Audio(filename=str(path)))
@@ -512,16 +527,27 @@ In the saved-run path this cell executes after 4A returns. During an interactive
 ### Cell 6 — test the final adapter after completion
 
 ```python
-status_value = json.loads((RUN / "status.json").read_text())
-if status_value["status"] in ("complete", "smoke_complete"):
-    output = Path("/kaggle/working/urdu_test.wav")
-    subprocess.run([TRAIN_PYTHON, str(REPO / "synthesize.py"),
-                    "--adapter", str(RUN / "adapter_final"),
-                    "--text", "آج موسم بہت خوشگوار ہے اور ہم سب باہر سیر کے لیے جا رہے ہیں۔",
-                    "--output", str(output)], cwd=REPO, check=True)
-    display(Audio(filename=str(output)))
+if AUDIT_ONLY:
+    print("Dataset audit completed; set AUDIT_ONLY=False and enable GPU for training.")
 else:
-    print("Saved for continuation; rerun the same config to finish the epoch.")
+    status_value = json.loads((RUN / "status.json").read_text())
+    if status_value["status"] in ("complete", "smoke_complete"):
+        output = Path("/kaggle/working/urdu_test.wav")
+        subprocess.run([TRAIN_PYTHON, str(REPO / "synthesize.py"),
+                        "--adapter", str(RUN / "adapter_final"),
+                        "--text", "آج موسم بہت خوشگوار ہے اور ہم سب باہر سیر کے لیے جا رہے ہیں۔",
+                        "--output", str(output)], cwd=REPO, check=True)
+        display(Audio(filename=str(output)))
+    else:
+        print("Saved for continuation; rerun the same config to finish the epoch.")
 ```
 
 For a later Kaggle session, rerun Cells 1–4A with the **same commit, private repository, run ID, config and package versions**. Automatic remote restore handles continuation. The default cells need only the `HF_TOKEN` secret; rclone and its OAuth setup are unnecessary unless you deliberately choose the Drive backend.
+
+## When the dataset audit stops a run
+
+A traceback with `invalid/duplicate rows` means the audit rejected rows before encoding or model training. Read `data_error_summary.json` and `data_errors.json` in your run directory. The summary groups reasons by split and prints example paths and CSV lines in the notebook; full details remain in the adjacent file. The reports and valid-row inventory are also uploaded under `runs/<run_id>/audit/` when the selected backend permits it. No rows are automatically discarded and no audio is automatically converted. A duplicate can indicate evaluation leakage; it requires a split-aware correction rather than bypassing validation.
+
+The training subprocess exits after this error. If the saved notebook still says Running, it may be finishing output conversion; stopping that failed job does not interrupt active training. Save/download the diagnostic JSON before ending an interactive session if remote backup is unavailable. Updating GitHub will not update a process or notebook already running.
+
+Before using more GPU time, import the updated notebook, set `AUDIT_ONLY=True` in Cell 1, turn GPU off, and run it. This downloads/checks the data without model imports or tokenization. Fix the causes listed in the report, then repeat the audit. After it passes, set `AUDIT_ONLY=False`, enable GPU, and run the separate two-step smoke experiment before the full epoch. A CPU audit does not prove the CUDA training, VRAM budget or live checkpoint restore will succeed. Same-data/source/config requirements for checkpoint resume still apply; do not switch an existing trained run to modified code. An audit failure before encoding has no training checkpoint to preserve.

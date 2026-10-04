@@ -36,7 +36,7 @@ DEFAULTS = Path(__file__).parent / "configs/aslp50h.json"
 def cli():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config", type=Path, default=DEFAULTS)
-    p.add_argument("--mode", choices=["all", "prepare", "train", "storage-check"], default="all")
+    p.add_argument("--mode", choices=["all", "prepare", "train", "storage-check", "audit"], default="all")
     p.add_argument("--local-only", action="store_true", help="Explicitly opt out of remote checkpoint backups")
     p.add_argument("--checkpoint-backend", choices=["huggingface", "drive", "local"])
     p.add_argument("--hf-repo-id", help="Private Hugging Face model repo: USERNAME/REPOSITORY")
@@ -87,6 +87,10 @@ def cli():
         p.error("eval_samples/sample_count cannot be negative")
     if not 0 < cfg["learning_rate"] < 1 or not 0 <= cfg["warmup_ratio"] < 1:
         p.error("Invalid learning rate/warmup")
+    if cfg["invalid_row_policy"] not in ("skip", "strict"):
+        p.error("invalid_row_policy must be skip or strict")
+    if not 0 <= cfg["maximum_rejected_train_fraction"] < 1:
+        p.error("maximum_rejected_train_fraction must be in [0, 1)")
     return args, cfg
 
 
@@ -177,6 +181,65 @@ def locate_manifest(root, explicit, split):
     return matches[0] if matches else None
 
 
+def audit_problem_category(error):
+    for prefix, category in (
+        ('Duplicate path', 'duplicate_path'), ('Identical audio bytes', 'duplicate_audio'),
+        ('Empty text', 'invalid_text'), ('Expected 24kHz', 'audio_format'),
+        ('Invalid/overlong duration', 'duration'), ('Nonfinite or entirely silent', 'waveform'),
+        ('Empty trusted speaker', 'speaker')):
+        if error.startswith(prefix):
+            return category
+    return 'file_or_other_error'
+
+
+def report_audit_errors(run, problems, policy="strict"):
+    from collections import Counter
+    counts = Counter((p['split'], audit_problem_category(p['error'])) for p in problems)
+    summary = {'total': len(problems), 'groups': [
+        {'split': split, 'reason': reason, 'count': count}
+        for (split, reason), count in sorted(counts.items())], 'examples': problems[:10], 'policy': policy}
+    atomic_json(run / 'data_error_summary.json', summary)
+    if problems:
+        LOG.warning('Dataset audit exclusions (%s policy): %s', policy, summary['groups'])
+        for problem in summary['examples']:
+            LOG.warning('Audit example: split=%s CSV line=%s audio=%s reason=%s',
+                      problem['split'], problem['row'] + 2, problem.get('audio'), problem['error'])
+    return summary
+
+
+def audit_retention(splits, manifests, problems, cfg):
+    """Decide acceptance using row loss and all measurable rejected durations."""
+    summary = {}
+    for split, rows in splits.items():
+        rejected = [p for p in problems if p['split'] == split]
+        kept_seconds = sum(row['duration'] for row in rows)
+        rejected_seconds = sum(p['duration_seconds'] for p in rejected
+                               if p.get('duration_seconds') is not None)
+        known_seconds = kept_seconds + rejected_seconds
+        summary[split] = dict(clips=len(rows), hours=kept_seconds / 3600,
+            source_rows=manifests[split]['rows'], rejected_rows=len(rejected),
+            rejected_row_fraction=len(rejected) / max(1, manifests[split]['rows']),
+            rejected_known_hours=rejected_seconds / 3600,
+            rejected_unknown_duration_rows=sum(p.get('duration_seconds') is None for p in rejected),
+            rejected_known_hour_fraction=rejected_seconds / known_seconds if known_seconds else 0,
+            max_seconds=max((row['duration'] for row in rows), default=0))
+    errors = []
+    if problems and cfg['invalid_row_policy'] == 'strict':
+        errors.append(f'{len(problems)} invalid/duplicate rows under strict policy')
+    if not splits.get('train') or not splits.get('validation'):
+        errors.append('Train and validation must retain at least one valid row')
+    train = summary.get('train', {})
+    if cfg['invalid_row_policy'] == 'skip':
+        limit = cfg['maximum_rejected_train_fraction']
+        for key in ('rejected_row_fraction', 'rejected_known_hour_fraction'):
+            if train.get(key, 0) > limit:
+                errors.append(f'Training {key}={train[key]:.2%} exceeds configured {limit:.2%} limit')
+    if train.get('hours', 0) < cfg['minimum_train_hours']:
+        errors.append(f"Only {train.get('hours', 0):.2f} retained training hours; "
+                      f"minimum_train_hours={cfg['minimum_train_hours']}")
+    return summary, errors
+
+
 def audit_data(root, cfg, run):
     import numpy as np
     import soundfile as sf
@@ -196,6 +259,7 @@ def audit_data(root, cfg, run):
             raise ValueError(f"Missing trusted speaker column {speaker_col}")
         rows = []
         for i, original in enumerate(df.to_dict("records")):
+            duration, audio = None, None
             try:
                 text = clean_text(original["text"])
                 if not text or not re.search(r"[\u0600-\u06ff]", text):
@@ -230,29 +294,41 @@ def audit_data(root, cfg, run):
                                       rms=float(np.sqrt(np.mean(wav**2))),
                                       clipped_fraction=float(np.mean(np.abs(wav) >= 0.999)),
                                       text_changed=text != original["text"]))
-            except Exception as e:
-                problems.append(dict(split=split, row=i, audio=original.get("audio"), error=str(e)))
+            except (ValueError, OSError, RuntimeError) as e:
+                # Probe duration for rejected rows when the path/header is readable.
+                # Missing/corrupt files are recorded with unknown duration, never as zero hours.
+                if duration is None:
+                    try:
+                        probe = sf.info(audio or contained(root, original["audio"]))
+                        if probe.samplerate > 0 and probe.frames >= 0:
+                            duration = probe.frames / probe.samplerate
+                    except (ValueError, OSError, RuntimeError):
+                        pass
+                problems.append(dict(split=split, row=i, csv_line=i+2,
+                                     audio=original.get("audio"), error=str(e),
+                                     duration_seconds=duration))
             if (i+1) % 1000 == 0:
                 LOG.info("Audited %s %d/%d clips", split, i+1, len(df))
         splits[split] = rows
         manifest_info[split] = dict(file=path.name, sha256=sha256(path), rows=len(df))
     atomic_json(run / "data_errors.json", problems)
     pd.DataFrame(inventory).to_csv(run / "data_inventory.csv", index=False)
-    if problems:
-        raise ValueError(f"{len(problems)} invalid/duplicate rows; see data_errors.json. No rows silently dropped")
-    if not splits["train"] or not splits["validation"]:
-        raise ValueError("Train and validation must be nonempty")
-    summary = {s: dict(clips=len(rows), hours=sum(r["duration"] for r in rows)/3600,
-                       max_seconds=max((r["duration"] for r in rows), default=0))
-               for s, rows in splits.items()}
+    report_audit_errors(run, problems, cfg["invalid_row_policy"])
+    summary, failures = audit_retention(splits, manifest_info, problems, cfg)
     report = dict(splits=summary, manifests=manifest_info,
+                  invalid_row_policy=cfg["invalid_row_policy"],
+                  maximum_rejected_train_fraction=cfg["maximum_rejected_train_fraction"],
+                  audit_passed=not failures, failure_reasons=failures,
+                  duplicate_policy="First valid occurrence retained: train before validation before test",
                   training_cap=None, trusted_speaker_column=cfg["speaker_column"],
-                  split_limitations="Path and byte-duplicate checks cannot detect related source recordings; source/session-disjoint manifests are preferred")
+                  split_limitations="Duplicate evaluation rows are excluded; related recordings can still leak. Unknown rejected durations are not estimated")
     atomic_json(run / "dataset_report.json", report)
     atomic_json(run / "normalized_manifests.json", splits)
-    LOG.info("Measured dataset: %s", summary)
-    if summary["train"]["hours"] < cfg["minimum_train_hours"]:
-        raise ValueError(f"Only {summary['train']['hours']:.2f} training hours; expected >= {cfg['minimum_train_hours']}. Verify archive/manifests")
+    LOG.info("Measured retained dataset: %s", summary)
+    if failures:
+        raise ValueError('; '.join(failures) + f"; details: {run / 'dataset_report.json'}")
+    if problems:
+        LOG.warning("Continuing with %d documented row exclusions; all retained training rows will be used", len(problems))
     return splits
 
 
@@ -276,7 +352,7 @@ def environment(run):
     return env, freeze, gpu
 
 
-def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id):
+def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id, run):
     import torch
     import pandas as pd
     import soundfile as sf
@@ -285,10 +361,11 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
     cache.mkdir(parents=True, exist_ok=True)
     store.restore_files("cache/" + cache_id, cache)
     codec = None
-    files = {}
+    files, encoding_errors, accepted_audio = {}, [], {}
     try:
         for split in ("train", "validation"):
             rows, paths = splits[split], []
+            accepted_audio[split] = []
             folder = cache / split
             folder.mkdir(exist_ok=True)
             for start in range(0, len(rows), cfg["chunk_size"]):
@@ -300,12 +377,12 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
                     info = read_json(meta)
                     if info["row_identity"] != chunk_identity or info["sha256"] != sha256(path):
                         raise RuntimeError(f"Stale/corrupt cache chunk: {path}")
-                    if len(pd.read_parquet(path)) != len(subset):
+                    if len(pd.read_parquet(path)) != info["rows"] or info["rows"] + len(info.get("excluded", [])) != len(subset):
                         raise RuntimeError(f"Incomplete cache chunk: {path}")
                 else:
                     if codec is None:
                         codec = SNAC.from_pretrained(CODEC_ID, revision=cfg["codec_revision"]).eval().cuda()
-                    encoded = []
+                    encoded, excluded = [], []
                     for row in subset:
                         wav, sr = sf.read(root / row["audio"], dtype="float32")
                         if sr != 24000:
@@ -314,29 +391,67 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
                             codes = codec.encode(torch.from_numpy(wav).cuda().view(1, 1, -1))
                         c0, c1, c2 = [c[0].cpu().tolist() for c in codes]
                         tokens = interleave_codes(c0, c1, c2, cfg["dedup"])
-                        item = training_row(prompt_ids(tokenizer, row["text"], row["speaker"]),
-                                            tokens, cfg["objective"], cfg["max_length"], vocab_size)
+                        try:
+                            item = training_row(prompt_ids(tokenizer, row["text"], row["speaker"]),
+                                                tokens, cfg["objective"], cfg["max_length"], vocab_size)
+                        except ValueError as exc:
+                            if cfg["invalid_row_policy"] != "skip" or not str(exc).startswith("Sequence has "):
+                                raise
+                            excluded.append(dict(split=split, row=row["source_row"], audio=row["audio"],
+                                                 error=str(exc), duration_seconds=row["duration"],
+                                                 stage="encoding_context_limit"))
+                            continue
                         item.update(audio=row["audio"], raw_frames=len(c0), kept_frames=len(tokens)//7)
                         encoded.append(item)
                     temp = path.with_suffix(".tmp.parquet")
-                    pd.DataFrame(encoded).to_parquet(temp, index=False)
+                    pd.DataFrame(encoded, columns=["input_ids", "attention_mask", "labels", "length", "audio",
+                                                   "raw_frames", "kept_frames"]).to_parquet(temp, index=False)
                     temp.replace(path)
-                    atomic_json(meta, dict(row_identity=chunk_identity, rows=len(subset), sha256=sha256(path)))
+                    info = dict(row_identity=chunk_identity, rows=len(encoded), excluded=excluded, sha256=sha256(path))
+                    atomic_json(meta, info)
                     LOG.info("Encoded %s %d/%d", split, start+len(subset), len(rows))
                 # Retry upload even for local cached chunks; a previous upload may have failed.
                 for local in (path, meta):
                     store.put(local, f"cache/{cache_id}/{split}/{local.name}")
-                paths.append(str(path))
+                encoding_errors.extend(info.get("excluded", []))
+                accepted = pd.read_parquet(path)["audio"].tolist()
+                accepted_audio[split].extend(accepted)
+                if info["rows"]:
+                    paths.append(str(path))
+                atomic_json(run / "encoding_errors.json", encoding_errors)
             files[split] = paths
     finally:
         del codec
         gc.collect()
         torch.cuda.empty_cache()
+    for split, audio_paths in accepted_audio.items():
+        allowed = set(audio_paths)
+        splits[split] = [row for row in splits[split] if row["audio"] in allowed]
+    report = read_json(run / "dataset_report.json")
+    all_exclusions = read_json(run / "data_errors.json") + encoding_errors
+    summary, failures = audit_retention(splits, report["manifests"], all_exclusions, cfg)
+    report.update(splits=summary, encoding_excluded_rows=len(encoding_errors),
+                  audit_passed=not failures, failure_reasons=failures)
+    atomic_json(run / "dataset_report.json", report)
+    for name in ("encoding_errors.json", "dataset_report.json"):
+        store.put(run / name, "preparation/" + name)
+    if failures:
+        raise ValueError('; '.join(failures) + f"; see {run / 'dataset_report.json'}")
+    if encoding_errors:
+        LOG.warning("Excluded %d context-overflow sequences; retained hours/counts: %s", len(encoding_errors), summary)
     ds = load_dataset("parquet", data_files=files, cache_dir=str(cache / "hf"))
     for split in files:
         if len(ds[split]) != len(splits[split]):
             raise RuntimeError("Cache dataset coverage mismatch")
     return ds
+
+
+def optional_plots(run):
+    try:
+        plot_logs(run)
+    except Exception as exc:
+        LOG.warning('Optional plotting failed (%s); training/checkpoint work continues', type(exc).__name__)
+        append_jsonl(run / 'optional_errors.jsonl', dict(stage='plotting', error=str(exc)))
 
 
 def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
@@ -463,10 +578,10 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             atomic_json(run / "status.json", dict(status="checkpoint_saved", step=state.global_step,
                                                   epoch=state.epoch, timestamp=time.time()))
             # First secure training state. Optional samples cannot delay the first upload.
-            plot_logs(run)
+            optional_plots(run)
             store.backup(run, checkpoint)
             self.samples(state)
-            plot_logs(run)
+            optional_plots(run)
             # Refresh snapshot with samples; older remote snapshots remain recoverable.
             store.backup(run, checkpoint)
             LOG.info("Checkpoint %s safely archived%s", checkpoint.name,
@@ -520,12 +635,27 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     atomic_json(run / "status.json", dict(status="smoke_complete" if cfg["max_steps"] > 0 else "complete",
                                           step=trainer.state.global_step, epoch=trainer.state.epoch,
                                           validation=metrics))
-    plot_logs(run)
+    optional_plots(run)
     cp = latest_checkpoint(run)
     if not cp:
         raise RuntimeError("No resumable final checkpoint was created")
     store.backup(run, cp)
     LOG.info("Finished; adapter at %s", final)
+
+
+def audit_with_reports(root, cfg, run, store):
+    try:
+        return audit_data(root, cfg, run)
+    finally:
+        # Keep failed-audit evidence remotely even before the first model checkpoint.
+        for name in ('data_errors.json', 'data_error_summary.json', 'data_inventory.csv', 'dataset_report.json', 'normalized_manifests.json'):
+            path = run / name
+            if path.is_file():
+                try:
+                    store.put(path, 'audit/' + name)
+                except Exception as exc:
+                    LOG.warning('Audit report backup failed for %s (%s); local file retained',
+                                name, type(exc).__name__)
 
 
 def main():
@@ -549,6 +679,12 @@ def main():
         with checkpoint_store(cfg) as store:
             if args.mode == "storage-check":
                 LOG.info("Storage preflight passed; no dataset download or GPU training requested")
+                return
+            if args.mode == "audit":
+                # CPU-only dataset inspection; no model imports, SNAC or tokenization.
+                root = find_data(cfg, work)
+                audit_with_reports(root, cfg, run, store)
+                LOG.info("Dataset audit passed. No model loaded or training started")
                 return
             store.restore(run)
             status = run / "status.json"
@@ -584,7 +720,7 @@ def main():
             cfg["model_revision"] = api.model_info(cfg["model_id"], revision=cfg["model_revision"]).sha
             cfg["codec_revision"] = api.model_info(CODEC_ID, revision=cfg["codec_revision"]).sha
             root = find_data(cfg, work)
-            splits = audit_data(root, cfg, run)
+            splits = audit_with_reports(root, cfg, run, store)
             tokenizer = AutoTokenizer.from_pretrained(cfg["model_id"], revision=cfg["model_revision"])
             model_config = AutoConfig.from_pretrained(cfg["model_id"], revision=cfg["model_revision"])
             vocab_hash = fingerprint(tokenizer.get_vocab())
@@ -628,7 +764,7 @@ def main():
                 store.put(p, "preparation/" + p.name)
             # Preparation metadata and immutable chunks also resume before the first checkpoint.
             cache = work / "cache" / cache_id
-            ds = encode_data(root, splits, cfg, tokenizer, model_config.vocab_size, cache, store, cache_id)
+            ds = encode_data(root, splits, cfg, tokenizer, model_config.vocab_size, cache, store, cache_id, run)
             import numpy as np
             stats = {}
             for split in ("train", "validation"):
@@ -651,5 +787,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception:
-        LOG.exception("Run failed. Rerun the same command to resume the latest verified checkpoint")
+        LOG.exception("Run failed; inspect the error above. Resume is available only if a verified checkpoint exists")
         sys.exit(1)

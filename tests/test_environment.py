@@ -84,7 +84,7 @@ class EnvironmentTests(unittest.TestCase):
         source = ''.join(notebook['cells'][4]['source'])
         with tempfile.TemporaryDirectory() as directory:
             # Simulate a fresh runtime: no training Python has been installed yet.
-            scope = {'Path': Path, 'REPO': Path(directory),
+            scope = {'Path': Path, 'REPO': Path(directory), 'AUDIT_ONLY': False,
                      'sys': SimpleNamespace(executable='/host/python'), 'subprocess': subprocess}
             def simulate(command, **kwargs):
                 if 'setup_kaggle.py' in str(command):
