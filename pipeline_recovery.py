@@ -136,7 +136,8 @@ def memory_selection(dataset, run, probe, *, resuming=False, attempts=8):
                 raise
             if resuming:
                 raise RuntimeError('Current GPU cannot fit the saved training selection; dataset cannot change during checkpoint resume') from None
-            limit = math.ceil(row['length'] / 8) * 8
+            padded = math.ceil(row['length'] / 8) * 8
+            limit = max(8, math.floor(padded * 0.8 / 8) * 8)
             removed = dataset.filter(lambda r: math.ceil(r['length'] / 8) * 8 >= limit)
             exclusions.extend(dict(audio=r['audio'], length=r['length'], stage='training_memory_probe') for r in removed)
             LOG.warning('Backward memory probe exceeded GPU capacity; excluding %d sequences padded to >=%d tokens', len(removed), limit)

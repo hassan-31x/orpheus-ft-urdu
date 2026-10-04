@@ -817,10 +817,13 @@ def main():
             api = HfApi()
             cfg["model_revision"] = retry_io(lambda: api.model_info(cfg["model_id"], revision=cfg["model_revision"])).sha
             cfg["codec_revision"] = retry_io(lambda: api.model_info(CODEC_ID, revision=cfg["codec_revision"])).sha
-            root = find_data(cfg, work)
-            splits = audit_with_reports(root, cfg, run, store)
             tokenizer = retry_io(lambda: AutoTokenizer.from_pretrained(cfg["model_id"], revision=cfg["model_revision"]))
             model_config = retry_io(lambda: AutoConfig.from_pretrained(cfg["model_id"], revision=cfg["model_revision"]))
+            required_vocab = max(max(SPECIAL.values()), AUDIO_BASE + 7 * 4096 - 1) + 1
+            if model_config.vocab_size < required_vocab:
+                raise RuntimeError(f"Base model vocabulary {model_config.vocab_size} cannot represent Orpheus audio tokens; expected >= {required_vocab}")
+            root = find_data(cfg, work)
+            splits = audit_with_reports(root, cfg, run, store)
             vocab_hash = fingerprint(tokenizer.get_vocab())
             token_identity = dict(format_version=FORMAT_VERSION, model_id=cfg["model_id"],
                                   model_revision=cfg["model_revision"], tokenizer_sha256=vocab_hash,
