@@ -20,8 +20,12 @@ This is **stage 1: Urdu language adaptation**. Arbitrary labels such as “happy
 | `synthesize.py` | Single/batch inference from final or intermediate adapters |
 | `evaluate_asr.py` | Optional Urdu ASR WER/CER with bootstrap intervals |
 | `kaggle_run.ipynb` | Ready-to-import notebook; replace repository URL |
+| `setup_kaggle.py` | Dedicated training environment; preserves the installed CUDA stack |
+| `check_environment.py` | Project dependency validation and CPU/CUDA smoke checks |
 | `METHODOLOGY.md` | Research review, exact choices, ablations, evaluation limitations |
-| `tests/test_pipeline.py` | CPU tests for token and persistence correctness |
+| `tests/test_pipeline.py`, `tests/test_environment.py` | CPU tests for tokens, persistence, dependency checks and setup |
+
+For Kaggle shell commands elsewhere in this guide, replace `python` with `/kaggle/working/orpheus-env/bin/python` after running setup. Notebook subprocess cells already use `TRAIN_PYTHON`.
 
 Your original `finetune_aslp_10h.py`, paper, and `resources.md` are unchanged. The original Python file contains notebook shell syntax (`!nvidia-smi`); the new scripts are normal Python programs.
 

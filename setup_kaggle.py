@@ -1,7 +1,6 @@
 """Install into a dedicated venv without changing Kaggle's notebook packages."""
 import argparse
 import importlib.metadata as metadata
-import json
 from pathlib import Path
 import subprocess
 import sys
