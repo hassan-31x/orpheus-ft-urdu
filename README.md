@@ -129,22 +129,17 @@ Default speaker prompting is disabled because the trial identified unreliable sp
 
 Use the notebook cells at the end of this guide, or import `kaggle_run.ipynb`. Replace the repository URL first.
 
-`requirements-kaggle.txt` pins Transformers/TRL to the versions used by the inspected upstream Orpheus notebook and bounds the dataset/codec dependencies. Unsloth and the CUDA stack are not fully locked across all possible Kaggle images. Pip resolves a compatible stack, and each run records `pip freeze`, CUDA, Torch and package versions. **A resolved requirements file is evidence of the environment, not proof it was tested on every GPU.**
+Start a **fresh Kaggle session** after updating the repository, since the earlier setup changed the shared notebook packages. Replace the old installation cell with Cell 2 below (or import the updated notebook). Do not keep the old global `pip check` cell.
 
-The file also pins **`fsspec==2025.3.0` and `gcsfs==2025.3.0` together**. [Datasets 3.6.0 requires fsspec at most 2025.3.0](https://pypi.org/pypi/datasets/3.6.0/json), while newer Kaggle images may preinstall a gcsfs version that requires a newer exact fsspec version. Installing the matched [gcsfs 2025.3.0 release](https://pypi.org/pypi/gcsfs/2025.3.0/json) keeps that dependency pair consistent. Do not upgrade only fsspec to fix the warning; that would conflict with the chosen Datasets 3.x stack. The notebook prints these installed versions before retaining the strict `pip check`.
+`setup_kaggle.py` creates `/kaggle/working/orpheus-env` with its own pip and project packages. It inherits Kaggle's existing CUDA wheels using [venv's system-site-packages option](https://docs.python.org/3/library/venv.html). Installation goes into the venv and does not change the notebook kernel, Papermill, or Jupyter. This is isolation of installations, with shared base package visibility; it does not hide every preinstalled library.
 
-If you already hit `gcsfs 2025.12.0 ... fsspec==2025.12.0 ... fsspec 2025.3.0`, update your GitHub copy with the fixed requirements and rerun from a fresh Kaggle session. For an immediate repair in the current session, run:
+Torch, torchvision, torchaudio, Triton and xformers are constrained to their installed versions. An incompatible resolver result fails instead of replacing the CUDA stack or downloading a second Torch version. Requirements pin Unsloth, Transformers, TRL and Datasets; the remaining resolved versions are recorded. The project reads local Parquet and audio files and does not need `gcsfs`, `s3fs`, MoviePy, BigFrames, Pathos, TPOT, Colab, Dopamine or Gradio.
 
-```python
-import subprocess, sys
-subprocess.run([sys.executable, "-m", "pip", "install",
-                "fsspec[http]==2025.3.0", "gcsfs==2025.3.0"], check=True)
-subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
-```
+A global `pip check` reports conflicts for all installed tools, including unrelated Kaggle packages. `check_environment.py` instead checks **every active dependency reachable from this project's requirements**, including transitive version constraints and activated extras. Missing or incompatible project dependencies still fail the cell. CPU smoke checks exercise Urdu Parquet and WAV round trips; `--gpu` checks Unsloth, Trainer, SNAC and bitsandbytes imports plus an xformers CUDA attention backward pass. This does not replace the two-step model/checkpoint test below.
 
-Then rerun the import preflight and subsequent cells. This particular failure occurs before dataset processing or training starts; it does not indicate a failed model checkpoint. If `pip check` lists another conflict, retain its full output for diagnosis instead of disabling the check.
+To avoid spending GPU quota on dependency installation, use **GPU off** and run Cell 1, then the installation subprocess in Cell 2. Leave the `--gpu` subprocess for after enabling the GPU. A restarted Kaggle session may discard the venv; rerun setup on the actual GPU image, since CPU and GPU images can differ. `TRAIN_PYTHON` must be used for storage checks, training and inference; the notebook kernel remains on its original interpreter. No kernel restart is needed just to use the venv.
 
-Run `pip check` and the import preflight. Restart the kernel if installing packages has affected modules already imported in the notebook. The training subprocess imports Unsloth before Transformers as required. Do not manually install a random xformers/Torch wheel; match the [Unsloth installation guide](https://unsloth.ai/docs/get-started/install) to the runtime's Torch/CUDA versions if the preflight fails. Use Torch 2.6+ because resumable Trainer checkpoints load optimizer/RNG state through Torch serialization.
+Setup evidence is saved alongside the venv in `/kaggle/working/orpheus-env-setup/`: `installation.log`, `installation.json`, `cuda-constraints.txt`, `resolved-requirements.txt`, `cpu-check.json`, and `gpu-check.json`. Keep these with your experiment output. A failed check reports its actual project dependencies or import/kernel error; inspect that report before starting training. The local CPU regression tests do not prove compatibility with every Kaggle GPU image. Use Torch 2.6+ for resumable optimizer/RNG loading.
 
 Before a long run, create a **separate smoke config**:
 
@@ -379,7 +374,7 @@ Final validation loss is token cross entropy for the configured objective. It is
 
 | Problem | Action |
 |---|---|
-| `gcsfs` requires a different `fsspec` version | Use the updated requirements, which match both at `2025.3.0`. See Section 5 for the immediate repair cell. |
+| Global `pip check` lists conflicts for Kaggle tools | Start a fresh session and use the venv setup in Cell 2; project dependency checks replace the global check. See Section 5. |
 | Hub preflight fails | Check `HF_TOKEN` Secret access, token write permission, repository ID/type, private visibility, storage allowance and Internet. Try `--mode storage-check` first. |
 | Missing Hub repo ID | Set `hf_repo_id`, `--hf-repo-id` or `ORPHEUS_HF_REPO` to `USERNAME/REPOSITORY`. |
 | Optional Drive preflight fails | Check notebook Secret access, OAuth expiry, remote name, Drive scope, quota and Internet. No GPU training begins before the probe succeeds. |
@@ -423,10 +418,14 @@ subprocess.run(["git", "checkout", REPO_REF], cwd=REPO, check=True)
 
 ```python
 import sys
-subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(REPO / "requirements-kaggle.txt")], check=True)
-subprocess.run([sys.executable, "-c", "from importlib.metadata import version; print({p: version(p) for p in ('datasets', 'fsspec', 'gcsfs')})"], check=True)
-subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
-subprocess.run([sys.executable, "-c", "from unsloth import FastLanguageModel; import torch; from snac import SNAC; assert torch.cuda.is_available(); assert tuple(map(int, torch.__version__.split('+')[0].split('.')[:2])) >= (2,6); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"], check=True)
+ENV = Path("/kaggle/working/orpheus-env")
+TRAIN_PYTHON = str(ENV / "bin" / "python")
+# Installation and dependency/audio/Parquet checks work without a GPU.
+subprocess.run([sys.executable, str(REPO / "setup_kaggle.py"),
+                "--venv", str(ENV)], check=True)
+# Enable GPU for this check and subsequent training cells.
+subprocess.run([TRAIN_PYTHON, str(REPO / "check_environment.py"), "--gpu",
+                "--report", "/kaggle/working/orpheus-env-setup/gpu-check.json"], check=True)
 subprocess.run(["df", "-h", "/kaggle/working"], check=True)
 ```
 
@@ -444,7 +443,7 @@ cfg["session_hours"] = 10.5  # CHANGE to below the runtime limit displayed in yo
 CONFIG = Path("/kaggle/working/run-config.json")
 CONFIG.write_text(json.dumps(cfg, indent=2))
 RUN = Path(cfg["work_dir"]) / "runs" / cfg["run_id"]
-subprocess.run([sys.executable, str(REPO / "finetune_aslp_50h.py"),
+subprocess.run([TRAIN_PYTHON, str(REPO / "finetune_aslp_50h.py"),
                 "--config", str(CONFIG), "--mode", "storage-check"], cwd=REPO, check=True)
 ```
 
@@ -452,7 +451,7 @@ subprocess.run([sys.executable, str(REPO / "finetune_aslp_50h.py"),
 
 ```python
 # Blocks the notebook until training finishes or gracefully checkpoints for resume.
-subprocess.run([sys.executable, "-u", str(REPO / "finetune_aslp_50h.py"),
+subprocess.run([TRAIN_PYTHON, "-u", str(REPO / "finetune_aslp_50h.py"),
                 "--config", str(CONFIG)], cwd=REPO, check=True)
 ```
 
@@ -467,7 +466,7 @@ Use this instead of 4A only when you want to keep the interactive notebook open 
 ```python
 LOG_PATH = Path("/kaggle/working/orpheus-background.log")
 with LOG_PATH.open("a") as log:
-    proc = subprocess.Popen([sys.executable, "-u", str(REPO / "finetune_aslp_50h.py"),
+    proc = subprocess.Popen([TRAIN_PYTHON, "-u", str(REPO / "finetune_aslp_50h.py"),
                              "--config", str(CONFIG)], cwd=REPO,
                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 Path("/kaggle/working/orpheus.pid").write_text(str(proc.pid))
@@ -495,7 +494,7 @@ In the saved-run path this cell executes after 4A returns. During an interactive
 status_value = json.loads((RUN / "status.json").read_text())
 if status_value["status"] in ("complete", "smoke_complete"):
     output = Path("/kaggle/working/urdu_test.wav")
-    subprocess.run([sys.executable, str(REPO / "synthesize.py"),
+    subprocess.run([TRAIN_PYTHON, str(REPO / "synthesize.py"),
                     "--adapter", str(RUN / "adapter_final"),
                     "--text", "آج موسم بہت خوشگوار ہے اور ہم سب باہر سیر کے لیے جا رہے ہیں۔",
                     "--output", str(output)], cwd=REPO, check=True)

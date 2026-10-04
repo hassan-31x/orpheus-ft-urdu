@@ -1,15 +1,13 @@
 # Linux NVIDIA runtime only. See README: resolver and GPU smoke test required.
 # Transformers version follows the inspected upstream Orpheus notebook.
-unsloth
+unsloth==2026.9.14
 transformers==4.57.6
 trl==0.22.2
 # Explicit Hub dependency: compatible with the Transformers 4.x stack above.
 huggingface_hub>=0.34,<1
-datasets>=3.4.1,<4
-# Datasets 3.x caps fsspec at 2025.3.0. Match Kaggle's GCS driver to it;
-# otherwise preinstalled gcsfs 2025.12.0 breaks the strict pip check.
+datasets==3.6.0
+# Project dependencies live in a venv. GCS/S3 drivers are not used.
 fsspec[http]==2025.3.0
-gcsfs==2025.3.0
 snac>=1.2.1,<2
 soundfile>=0.13,<1
 numpy>=1.26,<3
@@ -20,3 +18,4 @@ matplotlib>=3.9
 tensorboard>=2.18
 psutil>=6
 scipy>=1.13
+packaging>=24
