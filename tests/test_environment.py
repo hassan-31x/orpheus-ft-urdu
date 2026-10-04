@@ -101,6 +101,17 @@ class EnvironmentTests(unittest.TestCase):
             self.assertIn('--gpu', first)
             self.assertIn('setup_kaggle.py', str(first))
 
+    def test_notebook_accepts_real_repository_owner_without_blacklist(self):
+        import re
+        notebook = json.loads(Path('kaggle_run.ipynb').read_text())
+        tree = ast.parse(''.join(notebook['cells'][2]['source']))
+        guard = next(node for node in tree.body if isinstance(node, ast.If))
+        condition = compile(ast.Expression(guard.test), '<repo-validation>', 'eval')
+        for repo in ('hassan-31x/orpheus-urdu-checkpoints', 'student/private-model'):
+            self.assertFalse(eval(condition, {'re': re, 'HF_REPO_ID': repo}))
+        for repo in ('invalid', 'a/b/c', 'username/'):
+            self.assertTrue(eval(condition, {'re': re, 'HF_REPO_ID': repo}))
+
     def test_notebook_uses_training_interpreter(self):
         notebook = json.loads(Path('kaggle_run.ipynb').read_text())
         for cell in notebook['cells']:

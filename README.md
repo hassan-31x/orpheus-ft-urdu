@@ -72,7 +72,7 @@ No rclone installation, Google OAuth client or Drive mount is needed for the def
 
 The script uploads and reads back a small probe, then exits for `storage-check`. Normal runs perform the same preflight before processing data. Private artifacts appear under `runs/<run_id>/` inside the repository. Neither the token nor a Hub login file is written into experiment artifacts. There is no need to run `huggingface-cli login` or enable Trainer's separate `push_to_hub` feature.
 
-Checkpoint uploads use synchronous [Hub upload/commit APIs](https://huggingface.co/docs/huggingface_hub/v0.36.0/en/guides/upload). A single commit publishes the complete snapshot archive and `latest.json` together. Restarts read the pointer, download the archive and verify its SHA-256 and checkpoint file hashes before resuming. Token-cache chunks and preparation metadata use the same private repository. Transient API failures are retried up to three attempts; authentication/permission errors stop immediately. A persistent failure leaves the previous committed checkpoint recoverable.
+Checkpoint uploads use synchronous [Hub upload/commit APIs](https://huggingface.co/docs/huggingface_hub/v0.36.0/en/guides/upload). A single commit publishes the complete snapshot archive and `latest.json` together. Restarts read the pointer, download the archive and verify its SHA-256 and checkpoint file hashes before resuming. Token-cache chunks and preparation metadata use the same private repository. Transient API failures are retried up to three attempts; initial authentication/permission failures stop before processing data. After preflight succeeds, failed writes are queued locally and retried at later checkpoints; the previous committed remote checkpoint remains recoverable. `backup_status.json` distinguishes local progress from remote durability.
 
 Check your Hugging Face private-storage allowance before a long run. Snapshots contain **optimizer state as well as adapter weights**, and remote history is retained. Removing files from the visible tree may not immediately reclaim historical storage; consult [Hub storage guidance](https://huggingface.co/docs/hub/storage-limits). No particular free storage capacity is assumed by this project.
 
@@ -125,7 +125,7 @@ CSV files must be UTF-8, with `audio` and `text` columns. Extra metadata is allo
 
 The auto-discovery supports `stage1_train.csv`/`stage1_validation.csv` and `train.csv`/`validation.csv` (also `val.csv`), inside a single matching archive folder. If the archive has multiple candidate datasets or different manifest names, set `data_dir`, `train_manifest`, `validation_manifest`, and optionally `test_manifest` in a copy of the config. Explicit manifest paths are relative to `data_dir`.
 
-The audit records every audio file's SHA-256, duration, peak, RMS, clipped fraction and transcript normalization changes. It checks nonempty Urdu-script text, finite/non-silent signals, duplicate audio paths and identical files across splits. The default `invalid_row_policy="skip"` excludes unusable and duplicate rows and records them in `data_errors.json`. It continues when the combined audit/context exclusions remove no more than 5% of training rows and 5% of measurable training hours, with at least `minimum_train_hours` retained. Set `invalid_row_policy="strict"` to reject any exclusion. Evaluation exclusions are reported separately and do not stop training unless validation becomes empty. Similar excerpts of the same source recording can still leak across splits: preserve source/session-disjoint splits whenever possible.
+The audit records every audio file's SHA-256, duration, peak, RMS, clipped fraction and transcript normalization changes. It checks nonempty Urdu-script text, finite/non-silent signals, duplicate audio paths and identical files across splits. The default `invalid_row_policy="skip"` excludes unusable and duplicate rows and records them in `data_errors.json`. The default `enforce_retention_limits=false` treats the 5% row/hour thresholds and `minimum_train_hours` as recorded warnings, so usable data continues automatically. Set `enforce_retention_limits=true` to enforce those thresholds. Set `invalid_row_policy="strict"` to reject any exclusion. Evaluation exclusions are reported separately and do not stop training unless validation becomes empty. Similar excerpts of the same source recording can still leak across splits: preserve source/session-disjoint splits whenever possible.
 
 Default speaker prompting is disabled because the trial identified unreliable speaker IDs. Do not use segment-local `SPEAKER_0001` as a global identity. If you have genuinely verified global speaker labels, set `speaker_column` and use the matching speaker string at inference. This is a separate conditioning experiment.
 
@@ -176,7 +176,7 @@ After verifying the smoke run, use `configs/aslp50h.json` with `max_steps=-1`. D
 | LoRA rank / alpha | 32 / 64; seven attention/MLP projections |
 | Learning rate | `1e-4` |
 | Schedule | cosine; 3% warmup |
-| Optimizer / decay / grad clip | 8-bit AdamW / `0.001` / `1.0` |
+| Optimizer / decay / grad clip | PyTorch AdamW / `0.001` / `1.0` |
 | Seed / sampling | 3407 / seeded random without replacement |
 | Checkpoint storage | Private Hugging Face model repository; `HF_TOKEN` + repository ID |
 | Sequence limit | 2048; record context-overflow exclusions without truncating |
@@ -241,7 +241,7 @@ orpheus_urdu/<run_id>/
 1. Encoding commits each 100-row chunk locally, computes its checksum and copies it to the selected private remote store with its metadata. A restart validates and reuses completed chunks. A chunk whose metadata/upload was interrupted is recomputed or uploaded again.
 2. Trainer checkpoints include adapter weights, optimizer, scheduler, mixed-precision state when applicable, RNG state, Trainer state and tokenizer. The script verifies required files, hashes the checkpoint files and writes `COMPLETE.json` only after saving finishes.
 3. A tar snapshot includes the current complete checkpoint and experiment evidence. It excludes other checkpoint directories, the local lock and the separate token cache.
-4. Hugging Face publishes the snapshot and `latest.json` in **one synchronous commit**. Drive uploads the immutable snapshot first and updates the pointer only after success. If upload/commit fails, the process stops and the previous remote checkpoint stays the resume target. Retrying with the same local runtime can upload the newer complete local checkpoint after continuing.
+4. Hugging Face publishes the snapshot and `latest.json` in **one synchronous commit**. Drive uploads the immutable snapshot first and updates the pointer only after success. If upload/commit fails, the verified checkpoint stays local, training continues, and a queue records the pending upload. The previous remote checkpoint remains the remote resume target until a newer upload succeeds. An outage cooldown prevents every optional file from repeatedly blocking on network retries.
 5. Snapshot archive hashes and checkpoint file hashes are verified on restore. A newer verified local checkpoint wins over an older remote checkpoint. Incomplete local checkpoint directories without a completion marker are skipped. A checksum mismatch raises an error so corruption is investigated rather than quietly used.
 6. Periodic samples are generated after the first checkpoint upload, then an updated snapshot is uploaded with the samples. Training RNG state is restored after monitoring. Each checkpoint may therefore have two immutable remote snapshots.
 7. Local retention is bounded; remote snapshots are retained for research/recovery and are never automatically deleted. Budget Hub/Drive space for adapter **and optimizer** state at each saved step. Choose a larger `save_steps` after the smoke run if upload/storage cost is excessive, and archive/remove obsolete snapshots manually after verifying your retained recovery copies. Hub repository history has its own storage implications.
@@ -410,19 +410,19 @@ These are the runnable setup cells requested for the workflow. You can also impo
 ### Cell 1 — clone a fixed version
 
 ```python
-import os, sys, subprocess
+import os, sys, subprocess, re
 from pathlib import Path
 
 REPO_URL = "https://github.com/hassan-31x/orpheus-ft-urdu.git"
 REPO_REF = "main"  # Use the same fixed commit for an experiment and its resumes.
-HF_REPO_ID = "YOUR_USERNAME/orpheus-urdu-checkpoints"  # EDIT THIS.
+HF_REPO_ID = "hassan-31x/orpheus-urdu-checkpoints"  # Your private model repository.
 AUDIT_ONLY = False  # Set True with GPU OFF to inspect data before training.
 MINIMUM_TRAIN_HOURS = 35  # The 47h archive contains ~38h train plus validation/test.
 SESSION_HOURS = 10.5  # Set below the limit displayed in your Kaggle account.
 REPO = Path("/kaggle/working/urdu-orpheus")
 
-if "YOUR_USERNAME" in HF_REPO_ID or "/" not in HF_REPO_ID:
-    raise ValueError("Set HF_REPO_ID to your private Hugging Face model repository first")
+if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", HF_REPO_ID):
+    raise ValueError("HF_REPO_ID must have the format username/repository")
 from kaggle_secrets import UserSecretsClient
 try:
     os.environ["HF_TOKEN"] = UserSecretsClient().get_secret("HF_TOKEN")
@@ -436,7 +436,7 @@ if not REPO.exists():
 # Fetch even when the directory already exists; checkout alone leaves old code.
 subprocess.run(["git", "fetch", "origin", REPO_REF], cwd=REPO, check=True)
 subprocess.run(["git", "checkout", "--detach", "FETCH_HEAD"], cwd=REPO, check=True)
-for name in ("setup_kaggle.py", "check_environment.py", "requirements-kaggle.txt"):
+for name in ("setup_kaggle.py", "check_environment.py", "requirements-kaggle.txt", "pipeline_recovery.py"):
     if not (REPO / name).is_file():
         raise RuntimeError(f"Repository version lacks {name}. Upload the updated project before running.")
 print("Project commit:", subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip())
@@ -467,6 +467,7 @@ cfg["hf_repo_id"] = HF_REPO_ID
 cfg["session_hours"] = SESSION_HOURS
 cfg["minimum_train_hours"] = MINIMUM_TRAIN_HOURS
 print("Minimum retained TRAIN split hours:", cfg["minimum_train_hours"])
+print("Retention thresholds:", "enforced" if cfg["enforce_retention_limits"] else "warnings only")
 print("Data policy:", cfg["invalid_row_policy"], "maximum training exclusion fraction:", cfg["maximum_rejected_train_fraction"])
 CONFIG = Path("/kaggle/working/run-config.json")
 CONFIG.write_text(json.dumps(cfg, indent=2))
@@ -523,7 +524,14 @@ status = RUN / "status.json"
 print(json.loads(status.read_text()) if status.exists() else ("Dataset audit only; no training started" if AUDIT_ONLY else "No training status recorded"))
 for path in sorted((RUN / "samples").glob("step-*/*.wav"))[-3:]:
     print(path)
-    display(Audio(filename=str(path)))
+    try:
+        display(Audio(filename=str(path)))
+    except (OSError, ValueError) as exc:
+        print("Optional playback unavailable:", type(exc).__name__)
+
+backup = RUN / "backup_status.json"
+if backup.exists():
+    print("Remote backup:", json.loads(backup.read_text()))
 ```
 
 In the saved-run path this cell executes after 4A returns. During an interactive detached run you can execute it repeatedly.
@@ -537,11 +545,17 @@ else:
     status_value = json.loads((RUN / "status.json").read_text())
     if status_value["status"] in ("complete", "smoke_complete"):
         output = Path("/kaggle/working/urdu_test.wav")
-        subprocess.run([TRAIN_PYTHON, str(REPO / "synthesize.py"),
-                        "--adapter", str(RUN / "adapter_final"),
-                        "--text", "آج موسم بہت خوشگوار ہے اور ہم سب باہر سیر کے لیے جا رہے ہیں۔",
-                        "--output", str(output)], cwd=REPO, check=True)
-        display(Audio(filename=str(output)))
+        try:
+            subprocess.run([TRAIN_PYTHON, str(REPO / "synthesize.py"),
+                            "--adapter", str(RUN / "adapter_final"),
+                            "--text", "آج موسم بہت خوشگوار ہے اور ہم سب باہر سیر کے لیے جا رہے ہیں۔",
+                            "--output", str(output)], cwd=REPO, check=True)
+            display(Audio(filename=str(output)))
+        except subprocess.CalledProcessError as exc:
+            print("Training adapter is saved at", RUN / "adapter_final")
+            print("Optional final synthesis failed; training remains complete. See synthesis_status.json.")
+            (RUN / "synthesis_status.json").write_text(json.dumps({"status": "failed", "returncode": exc.returncode}))
+
     else:
         print("Saved for continuation; rerun the same config to finish the epoch.")
 ```
@@ -554,15 +568,15 @@ A traceback with `invalid/duplicate rows` means the audit rejected rows before e
 
 The training subprocess exits after this error. If the saved notebook still says Running, it may be finishing output conversion; stopping that failed job does not interrupt active training. Save/download the diagnostic JSON before ending an interactive session if remote backup is unavailable. Updating GitHub will not update a process or notebook already running.
 
-Before using more GPU time, import the updated notebook, set `AUDIT_ONLY=True` in Cell 1, turn GPU off, and run it. This downloads/checks the data without model imports or tokenization. Small exclusions within the configured retention limits now pass automatically; excessive training losses still require reviewing the report. After it passes, set `AUDIT_ONLY=False`, enable GPU, and run the separate two-step smoke experiment before the full epoch. A CPU audit does not prove the CUDA training, VRAM budget or live checkpoint restore will succeed. Same-data/source/config requirements for checkpoint resume still apply; do not switch an existing trained run to modified code. An audit failure before encoding has no training checkpoint to preserve.
+Before using more GPU time, import the updated notebook, set `AUDIT_ONLY=True` in Cell 1, turn GPU off, and run it. This downloads/checks the data without model imports or tokenization. Exclusions now pass automatically under permissive defaults while retention warnings are recorded; train and validation must still remain nonempty. After it passes, set `AUDIT_ONLY=False`, enable GPU, and run the separate two-step smoke experiment before the full epoch. A CPU audit does not prove the CUDA training, VRAM budget or live checkpoint restore will succeed. Same-data/source/config requirements for checkpoint resume still apply; do not switch an existing trained run to modified code. An audit failure before encoding has no training checkpoint to preserve.
 
 ## Automatic fallbacks and their limits
 
-Defaults: `invalid_row_policy="skip"`, `maximum_rejected_train_fraction=0.05`, and the existing `minimum_train_hours=35`. Count and measurable-duration limits both apply to training. Missing/corrupt files may have unknown duration; the report identifies these and still counts them toward the row limit. A small row fraction alone cannot establish a small hour fraction. Validation and test have separate original/retained counts and hours; discarded evaluation duplicates change the benchmark denominator and must be reported.
+Defaults: `invalid_row_policy="skip"`, `enforce_retention_limits=false`, `maximum_rejected_train_fraction=0.05`, and `minimum_train_hours=35`. Count and measurable-duration thresholds produce warnings by default. Set `enforce_retention_limits=true` to make them stopping conditions. Missing/corrupt files may have unknown duration; the report identifies these and still counts them toward the row limit. A small row fraction alone cannot establish a small hour fraction. Validation and test have separate original/retained counts and hours; discarded evaluation duplicates change the benchmark denominator and must be reported.
 
-Sequences exceeding `max_length` are excluded during SNAC encoding, without truncating their speech/text pair. Their reasons/durations are in `encoding_errors.json`, their cache chunks record accepted and excluded rows, and cached restarts restore the same decision. The training retention limits include **audit plus encoding** exclusions. `training_manifests.json` records the final retained rows; the updated `dataset_report.json` records final hours/counts. One epoch now means one pass over that retained partition.
+Sequences exceeding `max_length` are excluded during SNAC encoding, without truncating their speech/text pair. Their reasons/durations are in `encoding_errors.json`, their cache chunks record accepted and excluded rows, and cached restarts restore the same decision. The retention report includes **audit plus encoding plus GPU-memory** exclusions. `training_manifests.json` records the final retained rows; the updated `dataset_report.json` records final hours/counts. One epoch now means one pass over that retained partition.
 
-Monitoring synthesis and plotting failures are logged without stopping checkpoint work. Temporary storage errors retain the existing bounded retries. Broken model/token formats, changed/corrupt checkpoints, empty train/validation partitions, excessive training exclusions, CUDA failures and persistent checkpoint-upload errors still stop; continuing in those cases would not guarantee a usable, resumable experiment. Automatic changes to LR, context length, optimizer or batch geometry are not applied mid-run. No fallback can guarantee every Kaggle run succeeds.
+Monitoring synthesis and plotting failures are logged without stopping checkpoint work. Temporary downloads receive bounded retries; failed remote writes are queued while verified local state is retained. Broken model/token formats, changed/corrupt optimizer checkpoints, empty train/validation partitions, and unusable CUDA kernels still stop. Local disk exhaustion cannot be hidden because the required training artifacts cannot then be saved. Automatic changes to LR, context length, optimizer or batch geometry are not applied mid-run. No fallback can guarantee every Kaggle run succeeds.
 
 For this update, upload all changed files and re-import the notebook, then leave `AUDIT_ONLY=False` to audit, skip small exclusions and proceed automatically. Do not update a live process. Since the reported failure occurred before encoding/training, that failed run has no optimizer progress to lose. Existing trained runs require their original code/config/environment for exact resume.
 
@@ -570,4 +584,16 @@ For this update, upload all changed files and re-import the notebook, then leave
 
 The failed run retained **17,392 training clips / 37.4096h**, **2,129 validation clips / 4.6381h**, and **2,142 test clips / 4.6911h**: **46.7388h total**. The 423 exclusions were exact audio-byte duplicates: 277 train, 80 validation, 66 test. Training exclusions removed 0.4075h (about 24.45 minutes), or 1.0776% of measurable source training hours. The failure was the old `minimum_train_hours=40` check, not excessive filtering or a model/GPU error. The archive's total hours cannot be used as the minimum for its training partition.
 
-The default and notebook override now use `minimum_train_hours=35`, which accepts the measured training partition while retaining the 5% loss limits and rejecting accidentally selected small datasets. A regression test reproduces the logged split counts/hours and verifies the default accepts them. If an existing `/kaggle/working/run-config.json` still contains 40, set it to 35 before rerunning; changing the repository JSON alone does not rewrite a previously generated run config. This failure happened before tokenization and training, so there is no optimizer progress to preserve.
+The default and notebook override now use `minimum_train_hours=35`, which accepts the measured training partition. Retention floors are now warnings under the permissive default; strict enforcement remains configurable. A regression test reproduces the logged split counts/hours and verifies the default accepts them. If an existing `/kaggle/working/run-config.json` still contains 40, set it to 35 before rerunning; changing the repository JSON alone does not rewrite a previously generated run config. This failure happened before tokenization and training, so there is no optimizer progress to preserve.
+
+## Unattended recovery review
+
+Read `REVIEW.md` for the complete stage-by-stage review and test boundaries. The notebook now performs model forward/backward memory checks automatically, before any optimizer updates. It tries the longest retained training sequence at the configured microbatch, exercises up to two accumulated backward passes, and reserves estimated AdamW-state/temporary memory. If a fresh run gets CUDA OOM, it lowers the allowed padded length by roughly 20%, records the discarded rows, and retries up to eight times. It never truncates audio against a full transcript. `training_selection.json` freezes the accepted training order/IDs for resume; `effective_training_manifests.json` records the final rows. A resumed optimizer checkpoint cannot silently switch to a different selection.
+
+Default `optimizer="adamw_torch"` uses standard PyTorch AdamW for LoRA parameters, avoiding an additional bitsandbytes optimizer kernel dependency. Base loading remains 4-bit and still requires compatible bitsandbytes. This choice increases optimizer memory relative to 8-bit AdamW; the backward preflight reserves estimated state memory. Keep `adamw_8bit` only for a separately measured experiment. A memory probe is an early compatibility check, not a guarantee against all later allocator or kernel failures.
+
+Unreadable/invalid audio encountered during encoding, codec OOM on an individual clip, and context overflow produce documented row exclusions. Verified chunks are reused without downloading over existing files; damaged/incomplete derived chunks are rebuilt. A remote cache download failure permits re-encoding missing chunks. Optimizer checkpoint restore and checksum verification remain strict.
+
+`pending_uploads.json` and `backup_status.json` track remote writes. Failed uploads use a 60-second cooldown, then retry on subsequent writes/checkpoints; at most eight queued optional files drain per successful checkpoint. Final and completed-run backup attempts bypass cooldown once. Training can finish locally with **remote backup pending**. If Kaggle deletes that runtime before uploads succeed, only the previously uploaded checkpoint is recoverable; queued files are not remote backups. Check the displayed backup status before discarding outputs. No credential values are put in the queue.
+
+Optional TensorBoard, plotting, sample generation, validation and final notebook synthesis failures are recorded rather than turning usable training progress into a failed notebook. `evaluation_status.json` records unavailable evaluation; no placeholder loss is fabricated. The final adapter is exported before whole-validation evaluation. Canonical `metrics.jsonl` and checkpoint files remain required.
