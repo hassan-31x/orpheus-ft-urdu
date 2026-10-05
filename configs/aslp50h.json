@@ -47,5 +47,7 @@
   "invalid_row_policy": "skip",
   "maximum_rejected_train_fraction": 0.05,
   "enforce_retention_limits": false,
-  "optimizer": "adamw_torch"
+  "optimizer": "adamw_torch",
+  "test_train_clips": null,
+  "test_validation_clips": null
 }

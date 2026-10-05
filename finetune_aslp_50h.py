@@ -81,6 +81,11 @@ def cli():
         p.error("max_steps must be -1 (full epoch) or a positive smoke-test step limit")
     if cfg["max_steps"] > 0 and "smoke" not in cfg["run_id"]:
         p.error("A max_steps override requires 'smoke' in run_id to distinguish it from full-epoch results")
+    for k in ("test_train_clips", "test_validation_clips"):
+        if cfg[k] is not None and (not isinstance(cfg[k], int) or cfg[k] < 1):
+            p.error(f"{k} must be null or a positive integer")
+    if (cfg["test_train_clips"] or cfg["test_validation_clips"]) and "smoke" not in cfg["run_id"]:
+        p.error("A test clip subset requires 'smoke' in run_id to distinguish it from full-epoch results")
     if cfg["sampling"] not in ("random", "length") or cfg["precision"] not in ("4bit", "16bit"):
         p.error("Invalid sampling or precision")
     if cfg["speaker_column"] is not None and not cfg["speaker_column"]:
@@ -272,8 +277,14 @@ def audit_data(root, cfg, run):
         speaker_col = cfg["speaker_column"]
         if speaker_col and speaker_col not in df:
             raise ValueError(f"Missing trusted speaker column {speaker_col}")
+        source_rows = len(df)
+        # Test runs: seeded subset BEFORE audit/encoding; original CSV row numbers are kept.
+        limit = cfg.get("test_train_clips") if split == "train" else cfg.get("test_validation_clips")
+        if limit and len(df) > limit:
+            df = df.sample(n=limit, random_state=cfg["seed"]).sort_index()
+            LOG.warning("TEST SUBSET: %s uses %d of %d manifest rows", split, len(df), source_rows)
         rows = []
-        for i, original in enumerate(df.to_dict("records")):
+        for i, original in zip(df.index.tolist(), df.to_dict("records")):
             duration, audio = None, None
             try:
                 text = clean_text(original["text"])
@@ -325,7 +336,7 @@ def audit_data(root, cfg, run):
             if (i+1) % 1000 == 0:
                 LOG.info("Audited %s %d/%d clips", split, i+1, len(df))
         splits[split] = rows
-        manifest_info[split] = dict(file=path.name, sha256=sha256(path), rows=len(df))
+        manifest_info[split] = dict(file=path.name, sha256=sha256(path), rows=len(df), source_rows=source_rows)
     atomic_json(run / "data_errors.json", problems)
     pd.DataFrame(inventory).to_csv(run / "data_inventory.csv", index=False)
     report_audit_errors(run, problems, cfg["invalid_row_policy"])
@@ -335,7 +346,9 @@ def audit_data(root, cfg, run):
                   maximum_rejected_train_fraction=cfg["maximum_rejected_train_fraction"],
                   audit_passed=not failures, failure_reasons=failures,
                   duplicate_policy="First valid occurrence retained: train before validation before test",
-                  training_cap=None, trusted_speaker_column=cfg["speaker_column"],
+                  training_cap=dict(train=cfg.get("test_train_clips"), validation_and_test=cfg.get("test_validation_clips"))
+                  if cfg.get("test_train_clips") or cfg.get("test_validation_clips") else None,
+                  trusted_speaker_column=cfg["speaker_column"],
                   split_limitations="Duplicate evaluation rows are excluded; related recordings can still leak. Unknown rejected durations are not estimated")
     atomic_json(run / "dataset_report.json", report)
     atomic_json(run / "normalized_manifests.json", splits)
@@ -772,7 +785,8 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     atomic_json(final / "resolved_config.json", cfg)
     metrics = trainer.evaluate(eval_dataset=ds["validation"], metric_key_prefix="full_validation")
     optional_action(lambda: trainer.save_metrics("validation", metrics), stage="validation metrics export")
-    atomic_json(run / "status.json", dict(status="smoke_complete" if cfg["max_steps"] > 0 else "complete",
+    smoke = cfg["max_steps"] > 0 or bool(cfg.get("test_train_clips") or cfg.get("test_validation_clips"))
+    atomic_json(run / "status.json", dict(status="smoke_complete" if smoke else "complete",
                                           step=trainer.state.global_step, epoch=trainer.state.epoch,
                                           validation=metrics))
     optional_plots(run)
