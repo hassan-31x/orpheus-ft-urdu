@@ -224,3 +224,47 @@ def save_with_space_retry(operation, recover):
         LOG.warning('Checkpoint write exhausted disk; reclaiming space and retrying in memory')
         recover()
         return operation()
+
+
+def reconcile_run_identity(run, identity):
+    """Refresh preparation-only attempts; never reinterpret saved optimizer state."""
+    import shutil
+    from orpheus_utils import latest_checkpoint, append_jsonl
+    run = Path(run)
+    path = run / 'run_identity.json'
+    if not path.exists() or read_json(path) == identity:
+        return False
+    previous = latest_checkpoint(run)
+    if previous is not None:
+        raise RuntimeError(f'Verified checkpoint {previous.name} belongs to different data/config/code/dependencies. '
+                           'Restore its original versions or use a new run_id; saved training state was preserved')
+    # No verified optimizer state exists. Keep the earlier attempt's evidence,
+    # then allow a fresh optimizer schedule under the current identity.
+    history = run / 'attempt_history'
+    history.mkdir(exist_ok=True)
+    attempt = history / f'{time.time_ns()}'
+    attempt.mkdir()
+    for name in ('run_identity.json', 'resolved_config.json', 'environment.json',
+                 'requirements-resolved.txt', 'token_format.json', 'run.log',
+                 'metrics.jsonl', 'optional_errors.jsonl', 'parameters.json',
+                 'trainable_parameters.txt', 'status.json'):
+        source = run / name
+        if source.is_file():
+            shutil.copy2(source, attempt / name)
+    if (run / 'source').is_dir():
+        shutil.copytree(run / 'source', attempt / 'source')
+    # Saved memory selections/metrics belong to the previous attempt. Audio and
+    # content-addressed encoded caches are untouched and verified on reuse.
+    for name in ('training_selection.json', 'effective_training_manifests.json',
+                 'memory_preflight.json', 'metrics.jsonl', 'optional_errors.jsonl',
+                 'status.json', 'train_results.json', 'validation_results.json',
+                 'trainer_state.json'):
+        source = run / name
+        if source.is_file():
+            shutil.move(str(source), str(attempt / name))
+    append_jsonl(run / 'attempt_recovery.jsonl', dict(
+        timestamp=time.time(), reason='identity_changed_without_verified_checkpoint',
+        evidence=str(attempt.relative_to(run)), optimizer_restarts_at_step=0))
+    LOG.warning('Earlier attempt has NO verified checkpoint. Archived its evidence at %s; '
+                'continuing automatically with a fresh optimizer schedule. Audio/cache files retained', attempt)
+    return True

@@ -608,7 +608,7 @@ For the already-failed job:
 
 1. Keep the existing Kaggle session/files if available. The exited training subprocess has lost unsaved in-memory weights; an incomplete checkpoint cannot restore that progress.
 2. Upload the updated project to GitHub and import the updated `kaggle_run.ipynb` (a Git fetch does not replace notebook cells).
-3. If the failed run has **no verified checkpoint**, set `RUN_ID_OVERRIDE = "aslp50h-diskfix-v1"` in the first cell. Keep that value on subsequent resumes. This avoids mixing the old code identity with the new experiment. If a verified checkpoint exists, retain its files and original source; this update does not bypass the strict source-identity resume check.
+3. Keep your existing run ID. If the earlier attempt has **no verified checkpoint**, the updated script automatically archives its metadata and metrics under `attempt_history/`, resets stale training selections, and starts a fresh optimizer schedule. No run-ID override or metadata deletion is required. If a verified checkpoint exists, retain its files and original source; the strict source-identity resume check still applies.
 4. In the existing runtime, you can reclaim only the known redundant archive and incomplete checkpoint files with the cell below, **after the old training subprocess has stopped**. Preserve complete checkpoints. Then run the updated notebook cells. Existing extracted audio is reused; token caches may be regenerated because source fingerprints changed.
 
 ```python
@@ -625,3 +625,7 @@ print("Free GiB:", shutil.disk_usage(work).free / 2**30)
 ```
 
 Do not delete Hugging Face model caches, extracted WAVs, or sealed checkpoints to make a run appear resumable. If the remaining disk cannot fit the budget, place the source data on a mounted Kaggle Dataset and set `data_dir` accordingly before starting a new experiment.
+
+### Updated code after an attempt without a saved checkpoint
+
+A changed source fingerprint used to stop even when only preparation metadata existed. The script now checks for a verified checkpoint first. With no verified checkpoint, it preserves earlier evidence in `attempt_history/`, records `attempt_recovery.jsonl`, clears stale memory selections and per-attempt metrics, and continues automatically from optimizer step zero. Audio and content-addressed caches remain; cache reuse still requires the current fingerprint. With a verified checkpoint, a mismatched identity still stops rather than altering saved training semantics. An empty Hugging Face commit warning is informational and is unrelated to this check.

@@ -45,3 +45,7 @@ This version changes source/config identities and the default optimizer. Existin
 Added full embedding-aware storage estimates before optimizer steps and checkpoint saves, redundant ZIP removal with extraction reuse, no pip download cache for new installs, step-1 checkpointing, protected checkpoint pruning, one in-process ENOSPC checkpoint retry, and notebook disk diagnostics. Resized embeddings are retained. Existing incomplete files can be cleaned with the documented recovery cell after the failed subprocess exits. Strict source identity is retained; the notebook exposes a run-ID override for fresh attempts with no recoverable checkpoint.
 
 Validation: 66 CPU tests passed, including frozen embedding sizing, Rust-style ENOSPC retry, preservation of latest/pending checkpoints, and propagation of unrelated errors. Real Kaggle disk capacity and CUDA execution are unverified locally.
+
+## October 5: stale identity after preparation-only failure
+
+Added automatic identity reconciliation when no verified checkpoint exists. Earlier attempt evidence is archived, stale selection/metrics are removed from the active attempt, and training can proceed from step zero without renaming the run. Saved verified checkpoints remain protected by identity validation. 69 CPU tests pass, including partial checkpoint recovery, evidence preservation, unchanged-identity behavior, and rejection of changed identity with verified optimizer state.

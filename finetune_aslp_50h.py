@@ -29,7 +29,7 @@ from orpheus_utils import (
     seal_checkpoint, sha256, training_row,
 )
 
-from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation, checkpoint_budget, ensure_checkpoint_space, save_with_space_retry
+from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation, checkpoint_budget, ensure_checkpoint_space, save_with_space_retry, reconcile_run_identity
 
 LOG = logging.getLogger("orpheus_urdu")
 DEFAULTS = Path(__file__).parent / "configs/aslp50h.json"
@@ -870,8 +870,7 @@ def main():
                             source_sha256={name: sha256(Path(__file__).parent / name) for name in
                                            ("finetune_aslp_50h.py", "orpheus_utils.py", "synthesize.py", "pipeline_recovery.py")})
             identity_path = run / "run_identity.json"
-            if identity_path.exists() and read_json(identity_path) != identity:
-                raise RuntimeError("Run data/config/code/dependencies changed. Use a new run_id or restore original versions from requirements-resolved.txt")
+            reconcile_run_identity(run, identity)
             atomic_json(run / "environment.json", env)
             (run / "requirements-resolved.txt").write_text(freeze)
             if gpu:
