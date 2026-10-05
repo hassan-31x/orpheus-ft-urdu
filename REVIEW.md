@@ -39,3 +39,9 @@ Tests using fake tensors, datasets and Hub APIs verify decisions and persistence
 The permissive policy can exclude much more data than planned. Counts, hours, reasons and evaluation denominators must be reported; a successful process is not evidence of a good Urdu voice. A pending local upload is not a remote backup. If a runtime is deleted during an outage, unuploaded updates/cache chunks can be lost. Neither scenario is concealed as a fully recovered run.
 
 This version changes source/config identities and the default optimizer. Existing trained checkpoints require their original version/config for exact resume. The supplied log failed before encoding/optimization, so that particular run has no optimizer progress affected by this change.
+
+## October 5: disk exhaustion during PEFT checkpoint save
+
+Added full embedding-aware storage estimates before optimizer steps and checkpoint saves, redundant ZIP removal with extraction reuse, no pip download cache for new installs, step-1 checkpointing, protected checkpoint pruning, one in-process ENOSPC checkpoint retry, and notebook disk diagnostics. Resized embeddings are retained. Existing incomplete files can be cleaned with the documented recovery cell after the failed subprocess exits. Strict source identity is retained; the notebook exposes a run-ID override for fresh attempts with no recoverable checkpoint.
+
+Validation: 66 CPU tests passed, including frozen embedding sizing, Rust-style ENOSPC retry, preservation of latest/pending checkpoints, and propagation of unrelated errors. Real Kaggle disk capacity and CUDA execution are unverified locally.

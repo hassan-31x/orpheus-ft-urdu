@@ -164,3 +164,63 @@ def optional_evaluation(operation, run, step, cleanup):
         append_jsonl(Path(run) / 'optional_errors.jsonl', record)
         atomic_json(Path(run) / 'evaluation_status.json', dict(status='failed', **record))
         return {}
+
+
+def directory_bytes(path):
+    return sum(p.stat().st_size for p in Path(path).rglob('*') if p.is_file())
+
+
+def checkpoint_budget(model):
+    """Budget full embeddings: PEFT may include frozen resized vocabulary weights."""
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    embedding = 0
+    for getter in ('get_input_embeddings', 'get_output_embeddings'):
+        layer = getattr(model, getter, lambda: None)()
+        if layer is not None:
+            embedding += sum(p.numel() * max(p.element_size(), 4) for p in layer.parameters())
+    # FP32 adapter, AdamW state, gradients/serialization slack, metadata.
+    return trainable * 16 + embedding + 256 * 1024**2
+
+
+def ensure_checkpoint_space(run, checkpoint_bytes, *, remote, protected=()):
+    """Keep newest verified state; prune only older verified checkpoints if needed."""
+    import shutil
+    from orpheus_utils import latest_checkpoint
+    run = Path(run)
+    latest = latest_checkpoint(run)
+    protected = {Path(p).resolve() for p in protected if p}
+    if latest:
+        protected.add(latest.resolve())
+    # New full checkpoint plus uncompressed upper bound for upload tar and final adapter.
+    extras = sum(directory_bytes(p) if p.is_dir() else p.stat().st_size
+                 for p in run.iterdir() if not p.name.startswith('checkpoint-'))
+    required = checkpoint_bytes * (3 if remote else 2) + extras + 512 * 1024**2
+    removed = []
+    candidates = sorted(run.glob('checkpoint-*'), key=lambda p: int(p.name.split('-')[-1])
+                        if p.name.split('-')[-1].isdigit() else -1)
+    for candidate in candidates:
+        if shutil.disk_usage(run).free >= required:
+            break
+        if candidate.resolve() not in protected and verify_checkpoint(candidate):
+            shutil.rmtree(candidate)
+            removed.append(candidate.name)
+    free = shutil.disk_usage(run).free
+    report = dict(free_bytes=free, required_bytes=required, checkpoint_estimate_bytes=checkpoint_bytes,
+                  removed_old_checkpoints=removed, enough=free >= required)
+    atomic_json(run / 'disk_budget.json', report)
+    if free < required:
+        raise OSError(errno.ENOSPC, f'Checkpoint disk budget needs {required / 2**30:.2f} GiB free; '
+                      f'only {free / 2**30:.2f} GiB available. See disk_budget.json')
+    return report
+
+
+def save_with_space_retry(operation, recover):
+    """Retry ENOSPC once in the SAME process, retaining in-memory training state."""
+    try:
+        return operation()
+    except Exception as exc:
+        if getattr(exc, 'errno', None) != errno.ENOSPC and 'No space left on device' not in str(exc):
+            raise
+        LOG.warning('Checkpoint write exhausted disk; reclaiming space and retrying in memory')
+        recover()
+        return operation()

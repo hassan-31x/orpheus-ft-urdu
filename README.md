@@ -597,3 +597,31 @@ Unreadable/invalid audio encountered during encoding, codec OOM on an individual
 `pending_uploads.json` and `backup_status.json` track remote writes. Failed uploads use a 60-second cooldown, then retry on subsequent writes/checkpoints; at most eight queued optional files drain per successful checkpoint. Final and completed-run backup attempts bypass cooldown once. Training can finish locally with **remote backup pending**. If Kaggle deletes that runtime before uploads succeed, only the previously uploaded checkpoint is recoverable; queued files are not remote backups. Check the displayed backup status before discarding outputs. No credential values are put in the queue.
 
 Optional TensorBoard, plotting, sample generation, validation and final notebook synthesis failures are recorded rather than turning usable training progress into a failed notebook. `evaluation_status.json` records unavailable evaluation; no placeholder loss is fabricated. The final adapter is exported before whole-validation evaluation. Canonical `metrics.jsonl` and checkpoint files remain required.
+
+### Disk-full checkpoint failure (October 5 fix)
+
+`SafetensorError ... No space left on device` means the model was training but its checkpoint could not be written. PEFT can include frozen, resized embedding weights, so adapter saves can be much larger than the LoRA matrices. This version keeps those weights for correctness, budgets them plus optimizer state and temporary upload archives, checks free disk before training and each save, saves at optimizer step 1, and prunes older verified checkpoints under pressure while preserving the newest and any pending upload. A checkpoint write that runs out of space removes only its unsealed partial directory and retries once in the same process. Insufficient space after cleanup remains a hard failure; skipping every save would leave training unprotected.
+
+The dataset ZIP is removed after successful extraction, and a completed extraction is reused without downloading it again. WAVs and encoded data remain available. Dependency installation now uses `--no-cache-dir`. The notebook prints disk diagnostics instead of misleading old audit exclusions. `disk_budget.json` records estimated requirements and free space. Budgets are conservative estimates, not a guarantee against other processes consuming disk.
+
+For the already-failed job:
+
+1. Keep the existing Kaggle session/files if available. The exited training subprocess has lost unsaved in-memory weights; an incomplete checkpoint cannot restore that progress.
+2. Upload the updated project to GitHub and import the updated `kaggle_run.ipynb` (a Git fetch does not replace notebook cells).
+3. If the failed run has **no verified checkpoint**, set `RUN_ID_OVERRIDE = "aslp50h-diskfix-v1"` in the first cell. Keep that value on subsequent resumes. This avoids mixing the old code identity with the new experiment. If a verified checkpoint exists, retain its files and original source; this update does not bypass the strict source-identity resume check.
+4. In the existing runtime, you can reclaim only the known redundant archive and incomplete checkpoint files with the cell below, **after the old training subprocess has stopped**. Preserve complete checkpoints. Then run the updated notebook cells. Existing extracted audio is reused; token caches may be regenerated because source fingerprints changed.
+
+```python
+from pathlib import Path
+import shutil
+work = Path("/kaggle/working/orpheus")
+if (work / "extracted/.extraction.json").is_file():
+    (work / "dataset.zip").unlink(missing_ok=True)
+old_run = work / "runs/aslp50h-r32-lr1e4-seed3407"
+for cp in old_run.glob("checkpoint-*"):
+    if cp.is_dir() and not (cp / "COMPLETE.json").exists():
+        shutil.rmtree(cp)  # Failed, unsealed writes only; training must be stopped.
+print("Free GiB:", shutil.disk_usage(work).free / 2**30)
+```
+
+Do not delete Hugging Face model caches, extracted WAVs, or sealed checkpoints to make a run appear resumable. If the remaining disk cannot fit the budget, place the source data on a mounted Kaggle Dataset and set `data_dir` accordingly before starting a new experiment.

@@ -29,7 +29,7 @@ from orpheus_utils import (
     seal_checkpoint, sha256, training_row,
 )
 
-from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation
+from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation, checkpoint_budget, ensure_checkpoint_space, save_with_space_retry
 
 LOG = logging.getLogger("orpheus_urdu")
 DEFAULTS = Path(__file__).parent / "configs/aslp50h.json"
@@ -137,7 +137,9 @@ def find_data(cfg, work):
         return root.resolve()
     import gdown
     archive = work / "dataset.zip"
-    if not archive.exists():
+    dest = work / "extracted"
+    marker = dest / ".extraction.json"
+    if not archive.exists() and not marker.exists():
         temp = work / "dataset.partial.zip"
         LOG.info("Downloading supplied Drive archive")
         result = retry_io(lambda: gdown.download(url=cfg["download_url"], output=str(temp), fuzzy=True,
@@ -150,13 +152,15 @@ def find_data(cfg, work):
         temp.replace(archive)
     dest = work / "extracted"
     marker = dest / ".extraction.json"
-    archive_digest = sha256(archive)
+    archive_digest = sha256(archive) if archive.exists() else read_json(marker)["archive_sha256"]
     if marker.exists() and read_json(marker)["archive_sha256"] != archive_digest:
         raise RuntimeError("Archive changed; choose a new work_dir to avoid stale extracted files")
     if not marker.exists():
         LOG.info("Extracting and validating ZIP paths")
         safe_unzip(archive, dest)
         atomic_json(marker, {"archive_sha256": archive_digest})
+    # The successfully extracted WAVs are retained; ZIP is a redundant download.
+    archive.unlink(missing_ok=True)
     candidates = sorted({p.parent for p in dest.rglob("*.csv")
                          if p.name in ("stage1_train.csv", "train.csv", "train_manifest.csv")})
     if cfg["train_manifest"]:
@@ -514,6 +518,11 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
         return {key: torch.tensor([list(x[key]) + [pad]*(width-len(x[key])) for x in examples], dtype=torch.long)
                 for key, pad in [("input_ids", SPECIAL["pad"]), ("attention_mask", 0), ("labels", -100)]}
 
+    save_bytes = checkpoint_budget(model)
+    def check_disk():
+        pending = getattr(store, 'queue', {}).get('checkpoint')
+        return ensure_checkpoint_space(run, save_bytes, remote=bool(store.remote), protected=[pending])
+    check_disk()  # Before any optimizer steps, including on fresh runs.
     previous = latest_checkpoint(run)
     def probe_memory(row):
         try:
@@ -598,7 +607,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                 control.should_save = True
                 control.should_training_stop = True
                 LOG.warning("Stopping at step %d for session limit/signal", state.global_step)
-            if state.global_step >= state.max_steps:
+            if state.global_step == 1 or state.global_step >= state.max_steps:
                 control.should_save = True
             return control
 
@@ -692,6 +701,22 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
         load_best_model_at_end=False)
     monitor = Monitor()
     class ResilientTrainer(Trainer):
+        def _save_checkpoint(self, model, trial):
+            check_disk()
+            def recover():
+                import shutil
+                partial = run / f"checkpoint-{self.state.global_step}"
+                # Only the failed current write; never remove a sealed checkpoint.
+                if partial.is_dir() and not (partial / "COMPLETE.json").exists():
+                    shutil.rmtree(partial)
+                check_disk()
+            return save_with_space_retry(
+                lambda: super(ResilientTrainer, self)._save_checkpoint(model, trial), recover)
+
+        def save_model(self, *args, **kwargs):
+            check_disk()
+            return super(ResilientTrainer, self).save_model(*args, **kwargs)
+
         def evaluate(self, *args, **kwargs):
             def cleanup():
                 gc.collect()
