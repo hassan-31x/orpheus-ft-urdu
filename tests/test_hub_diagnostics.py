@@ -134,6 +134,51 @@ class DeferredStatusTests(unittest.TestCase):
             self.assertIn("Insufficient storage", status["last_upload_error"]["message"])
 
 
+class RateLimitTests(unittest.TestCase):
+    def test_long_rate_limit_raises_immediately_without_sleeping(self):
+        store = FakeHub(private=True).store()
+        call = Mock(side_effect=HttpError(429, headers={"ratelimit": '"api";r=0;t=240'}))
+        with patch("orpheus_utils.time.sleep") as sleep, self.assertRaises(HubOperationError) as caught:
+            store._call("batch upload", call)
+        sleep.assert_not_called()
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(caught.exception.diagnostics["retry_after"], "240")
+        self.assertEqual(caught.exception.diagnostics["category"], "rate_limit")
+
+    def test_put_many_is_one_commit(self):
+        hub = FakeHub(private=True)
+        with tempfile.TemporaryDirectory() as d:
+            files = []
+            for i in range(5):
+                f = Path(d) / f"{i}.json"; f.write_text(str(i)); files.append((f, f"cache/x/{i}.json"))
+            hub.store().put_many(files)
+        self.assertEqual(len(hub.commits), 1)
+        self.assertEqual(len(hub.commits[0]), 5)
+
+    def test_deferred_queue_backs_off_exponentially_and_honours_rate_limit(self):
+        now = [0]
+        limited = HubOperationError("limited", {"category": "rate_limit", "retry_after": "900"})
+        store = SimpleNamespace(remote="hf://x", put_many=Mock(side_effect=[TimeoutError(), TimeoutError(), limited, None]))
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d); f = run / "a.json"; f.write_text("{}")
+            queue = DeferredUploads(store, run, clock=lambda: now[0])
+            queue.put(f, "a.json")                      # fail 1 -> wait 60s
+            self.assertEqual(queue.next_attempt, 60)
+            now[0] = 30; queue.put(f, "b.json")          # still backing off: no request
+            self.assertEqual(store.put_many.call_count, 1)
+            now[0] = 60; queue.put(f, "c.json")          # fail 2 -> wait 120s
+            self.assertEqual(queue.next_attempt, 180)
+            now[0] = 180; queue.put(f, "d.json")         # rate limited -> wait retry_after
+            self.assertEqual(queue.next_attempt, 180 + 905)
+            status = json.loads((run / "backup_status.json").read_text())
+            self.assertEqual(status["last_upload_error"]["category"], "rate_limit")
+            self.assertEqual(status["pending_files"], 4)
+            now[0] = 1085; queue.put(f, "e.json")        # success: whole queue in ONE call
+            self.assertEqual(len(store.put_many.call_args.args[0]), 5)
+            self.assertEqual(queue.queue["files"], {})
+            self.assertEqual(queue.failures, 0)
+
+
 @unittest.skipUnless(importlib.util.find_spec("huggingface_hub"), "huggingface_hub not installed")
 class RealClientExceptionTests(unittest.TestCase):
     def test_real_hf_http_error_is_classified(self):

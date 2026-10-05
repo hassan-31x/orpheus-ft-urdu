@@ -53,14 +53,28 @@ class DeferredUploads:
         self.queue = self.load_queue()
         self.next_attempt = 0
         self.last_upload_error = None
+        self.failures = 0
 
     def _failed(self, stage, exc):
         # Redacted reason is kept so backup_status.json explains why state is LOCAL only.
-        self.next_attempt = self.clock() + 60
+        # Exponential backoff: repeated attempts during an outage/rate limit waste
+        # training time and keep a Hub rate limit tripped.
+        self.failures += 1
+        diagnostics = getattr(exc, 'diagnostics', {}) or {}
+        delay = min(60 * 2 ** (self.failures - 1), 1800)
+        if diagnostics.get('category') == 'rate_limit':
+            try:
+                delay = max(delay, float(diagnostics.get('retry_after')) + 5)
+            except (TypeError, ValueError):
+                delay = max(delay, 600)
+        self.next_attempt = self.clock() + delay
         self.last_upload_error = dict(stage=stage, exception_type=type(exc).__name__, message=redact(exc, limit=600),
-                                      category=getattr(exc, 'diagnostics', {}).get('category'),
-                                      time=time.time())
-        return self.last_upload_error['message']
+                                      category=diagnostics.get('category'), consecutive_failures=self.failures,
+                                      next_retry_seconds=round(delay), time=time.time())
+        return f"{self.last_upload_error['message']} [next retry in {round(delay)}s]"
+
+    def _succeeded(self):
+        self.failures = 0
 
     def __getattr__(self, name):
         return getattr(self.store, name)
@@ -104,17 +118,54 @@ class DeferredUploads:
             remote_snapshot_current=bool(self.remote and self.queue.get('last_uploaded_checkpoint') and self.queue['checkpoint'] is None)))
 
     def put(self, local, relative):
-        if not self.remote:
+        self.put_many([(local, relative)])
+
+    def put_many(self, items):
+        """Queue files and attempt them as ONE remote commit when not backing off."""
+        items = [(str(Path(local).resolve()), relative) for local, relative in items]
+        if not self.remote or not items:
             return
-        self.queue['files'][relative] = str(Path(local).resolve())
+        for local, relative in items:
+            self.queue['files'][relative] = local
         if self.clock() >= self.next_attempt:
-            try:
-                self.store.put(local, relative)
-                self.queue['files'].pop(relative, None)
-            except Exception as exc:
-                reason = self._failed('file upload', exc)
-                LOG.warning('Upload deferred (%s: %s); local artifact retained: %s', type(exc).__name__, reason, relative)
+            self._flush_queue('file upload')
         self.save()
+
+    def _flush_queue(self, stage, limit=500):
+        pending = []
+        for relative, local in list(self.queue['files'].items()):
+            if not Path(local).is_file():
+                self.queue['files'].pop(relative, None)
+                LOG.warning('Discarding stale optional upload queue entry: %s', relative)
+            elif len(pending) < limit:
+                pending.append((local, relative))
+        if not pending:
+            return True
+        try:
+            put_many = getattr(self.store, 'put_many', None)
+            if put_many is not None:
+                put_many(pending)
+            else:
+                for local, relative in pending:
+                    self.store.put(local, relative)
+        except Exception as exc:
+            reason = self._failed(stage, exc)
+            LOG.warning('Upload of %d files deferred (%s: %s); local artifacts retained, e.g. %s',
+                        len(pending), type(exc).__name__, reason, pending[0][1])
+            return False
+        self._succeeded()
+        for _, relative in pending:
+            self.queue['files'].pop(relative, None)
+        return True
+
+    def remote_names(self):
+        """Files already stored remotely; empty if listing fails (then uploads are retried)."""
+        try:
+            return set(self.store.names())
+        except Exception as exc:
+            LOG.warning('Remote file listing unavailable (%s); existing remote files may be re-uploaded',
+                        type(exc).__name__)
+            return set()
 
     def backup(self, run, checkpoint, *, force=False):
         if not verify_checkpoint(checkpoint):
@@ -138,15 +189,10 @@ class DeferredUploads:
         self.queue['checkpoint'] = None
         self.queue['last_uploaded_checkpoint'] = Path(checkpoint).name
         self.last_upload_error = None
-        # Bound optional queue draining so an outage cannot consume the session.
-        for relative, local in list(self.queue['files'].items())[:8]:
-            if not Path(local).is_file():
-                self.queue['files'].pop(relative, None)
-                LOG.warning('Discarding stale optional upload queue entry: %s', relative)
-                continue
-            self.put(local, relative)
-            if self.clock() < self.next_attempt:
-                break
+        self._succeeded()
+        # Queued optional files go up together in one bounded commit.
+        if self.queue['files']:
+            self._flush_queue('queued file upload')
         self.save()
         return True
 

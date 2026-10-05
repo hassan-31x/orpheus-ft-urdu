@@ -134,6 +134,17 @@ def checkpoint_store(cfg):
         yield store
 
 
+def upload_files(store, items):
+    """Batch uploads: a Hub store turns this into one commit instead of one per file."""
+    items = list(items)
+    put_many = getattr(store, "put_many", None)
+    if put_many is not None:
+        put_many(items)
+    else:
+        for local, relative in items:
+            store.put(local, relative)
+
+
 def find_data(cfg, work):
     if cfg["data_dir"]:
         root = Path(cfg["data_dir"])
@@ -393,6 +404,17 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
         LOG.warning("Remote cache restore unavailable (%s); verified local chunks reused and missing chunks regenerated", type(exc).__name__)
     codec = None
     files, encoding_errors, accepted_audio = {}, [], {}
+    # Chunks already stored remotely are never re-committed (previously every restart
+    # re-uploaded every chunk, one commit per file, which tripped Hub rate limits).
+    listing = getattr(store, "remote_names", None)
+    remote = listing() if listing is not None else set()
+    pending, last_flush = [], time.monotonic()
+
+    def flush(force=False):
+        nonlocal pending, last_flush
+        if pending and (force or len(pending) >= 40 or time.monotonic() - last_flush > 900):
+            upload_files(store, pending)
+            pending, last_flush = [], time.monotonic()
     try:
         for split in ("train", "validation"):
             rows, paths = splits[split], []
@@ -451,9 +473,12 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
                     info = dict(row_identity=chunk_identity, rows=len(encoded), excluded=excluded, sha256=sha256(path))
                     atomic_json(meta, info)
                     LOG.info("Encoded %s %d/%d", split, start+len(subset), len(rows))
-                # Retry upload even for local cached chunks; a previous upload may have failed.
+                # Upload chunks missing remotely (including ones a previous upload lost), in batches.
                 for local in (path, meta):
-                    store.put(local, f"cache/{cache_id}/{split}/{local.name}")
+                    relative = f"cache/{cache_id}/{split}/{local.name}"
+                    if relative not in remote:
+                        pending.append((local, relative))
+                flush()
                 encoding_errors.extend(info.get("excluded", []))
                 accepted = pd.read_parquet(path)["audio"].tolist()
                 accepted_audio[split].extend(accepted)
@@ -461,6 +486,7 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
                     paths.append(str(path))
                 atomic_json(run / "encoding_errors.json", encoding_errors)
             files[split] = paths
+            flush(force=True)
     finally:
         del codec
         gc.collect()
@@ -475,8 +501,8 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
                   audit_passed=not failures, failure_reasons=failures)
     atomic_json(run / "dataset_report.json", report)
     atomic_json(run / "training_manifests.json", splits)
-    for name in ("encoding_errors.json", "dataset_report.json", "training_manifests.json"):
-        store.put(run / name, "preparation/" + name)
+    upload_files(store, [(run / name, "preparation/" + name)
+                         for name in ("encoding_errors.json", "dataset_report.json", "training_manifests.json")])
     if failures:
         raise ValueError('; '.join(failures) + f"; see {run / 'dataset_report.json'}")
     if encoding_errors:
@@ -574,12 +600,12 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     summary, failures = audit_retention(splits, report["manifests"], original_problems + memory_problems, cfg)
     report.update(splits=summary, memory_excluded_rows=len(memory_problems), failure_reasons=failures)
     atomic_json(run / "dataset_report.json", report)
-    for name in ("training_selection.json", "dataset_report.json"):
-        store.put(run / name, "preparation/" + name)
     if failures:
+        upload_files(store, [(run / name, "preparation/" + name) for name in ("training_selection.json", "dataset_report.json")])
         raise ValueError('; '.join(failures))
     atomic_json(run / "effective_training_manifests.json", splits)
-    store.put(run / "effective_training_manifests.json", "preparation/effective_training_manifests.json")
+    upload_files(store, [(run / name, "preparation/" + name) for name in
+                         ("training_selection.json", "dataset_report.json", "effective_training_manifests.json")])
     LOG.info("Model backward preflight passed; training rows=%d, optimizer=%s", len(ds["train"]), cfg["optimizer"])
 
     eval_ds = ds["validation"]
@@ -802,14 +828,12 @@ def audit_with_reports(root, cfg, run, store):
         return audit_data(root, cfg, run)
     finally:
         # Keep failed-audit evidence remotely even before the first model checkpoint.
-        for name in ('data_errors.json', 'data_error_summary.json', 'data_inventory.csv', 'dataset_report.json', 'normalized_manifests.json'):
-            path = run / name
-            if path.is_file():
-                try:
-                    store.put(path, 'audit/' + name)
-                except Exception as exc:
-                    LOG.warning('Audit report backup failed for %s (%s); local file retained',
-                                name, type(exc).__name__)
+        names = ('data_errors.json', 'data_error_summary.json', 'data_inventory.csv', 'dataset_report.json', 'normalized_manifests.json')
+        items = [(run / name, 'audit/' + name) for name in names if (run / name).is_file()]
+        try:
+            upload_files(store, items)
+        except Exception as exc:
+            LOG.warning('Audit report backup failed (%s); local files retained', type(exc).__name__)
 
 
 def main():
@@ -936,12 +960,12 @@ def main():
             atomic_json(identity_path, identity)
             atomic_json(run / "resolved_config.json", cfg)
             atomic_json(run / "token_format.json", token_identity)
-            for p in (identity_path, run / "resolved_config.json", run / "dataset_report.json",
-                      run / "requirements-resolved.txt", run / "environment.json", run / "token_format.json"):
-                store.put(p, "preparation/" + p.name)
-            for source in sorted(sources.rglob("*")):
-                if source.is_file() and source.suffix in (".py", ".json"):
-                    store.put(source, "preparation/source/" + str(source.relative_to(sources)))
+            items = [(p, "preparation/" + p.name) for p in
+                     (identity_path, run / "resolved_config.json", run / "dataset_report.json",
+                      run / "requirements-resolved.txt", run / "environment.json", run / "token_format.json")]
+            items += [(source, "preparation/source/" + str(source.relative_to(sources)))
+                      for source in sorted(sources.rglob("*")) if source.is_file() and source.suffix in (".py", ".json")]
+            upload_files(store, items)
             # Preparation metadata and immutable chunks also resume before the first checkpoint.
             cache = work / "cache" / cache_id
             ds = encode_data(root, splits, cfg, tokenizer, model_config.vocab_size, cache, store, cache_id, run)
@@ -955,9 +979,8 @@ def main():
                                     kept_frames=int(sum(ds[split]["kept_frames"])))
             atomic_json(run / "token_statistics.json", stats)
             if args.mode == "prepare":
-                for p in run.iterdir():
-                    if p.is_file() and p.name != ".lock":
-                        store.put(p, "preparation/" + p.name)
+                upload_files(store, [(p, "preparation/" + p.name) for p in run.iterdir()
+                                     if p.is_file() and p.name != ".lock"])
                 LOG.info("Preparation complete; reuse same config/run_id for training")
                 return
             train(cfg, ds, tokenizer, splits, run, store, identity, session_start)

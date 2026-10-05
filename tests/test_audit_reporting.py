@@ -153,16 +153,28 @@ class EncodingFilterTests(unittest.TestCase):
             run = Path(directory)
             (run / 'data_errors.json').write_text('[]')
             (run / 'dataset_report.json').write_text(json.dumps({'manifests': {'train': {'rows': 2}, 'validation': {'rows': 1}}}))
-            store = SimpleNamespace(restore_files=lambda *args, **kwargs: None, put=lambda *args: None)
+            uploaded, commits = set(), []
+            def put_many(items):
+                commits.append([relative for _, relative in items])
+                uploaded.update(relative for _, relative in items)
+            store = SimpleNamespace(restore_files=lambda *args, **kwargs: None, put_many=put_many,
+                                    remote_names=lambda: set(uploaded))
             first_rows = rows()
             result = pipeline.encode_data(run, first_rows, cfg, None, 200000, run / 'cache', store, 'id', run)
             self.assertEqual(len(result['train']), 1)
+            cache_commits = [c for c in commits if c[0].startswith('cache/')]
+            # One commit per split flush (not one per file); both chunk files travel together.
+            self.assertEqual(cache_commits, [['cache/id/train/0000000.parquet', 'cache/id/train/0000000.json'],
+                                             ['cache/id/validation/0000000.parquet', 'cache/id/validation/0000000.json']])
+            commits.clear()
             self.assertEqual(first_rows['train'][0]['audio'], 'good.wav')
             self.assertEqual(len(json.loads((run / 'encoding_errors.json').read_text())), 1)
             second_rows = rows()
             result = pipeline.encode_data(run, second_rows, cfg, None, 200000, run / 'cache', store, 'id', run)
             self.assertEqual(len(result['train']), 1)
             snac.from_pretrained.assert_called_once()
+            # Restart with a valid cache: chunks already on the remote are not re-committed.
+            self.assertFalse([c for c in commits if c[0].startswith('cache/')])
             # The same rejected rows are restored and count against strict mode.
             with self.assertRaisesRegex(ValueError, 'strict'):
                 pipeline.encode_data(run, rows(), dict(cfg, invalid_row_policy='strict'), None,

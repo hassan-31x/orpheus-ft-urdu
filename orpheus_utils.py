@@ -234,6 +234,11 @@ class SnapshotStore:
         if self.remote:
             raise NotImplementedError
 
+    def put_many(self, items):
+        """Upload [(local, relative), ...]; Hub overrides this with one commit."""
+        for local, relative in items:
+            self.put(local, relative)
+
     def get(self, relative, local):
         raise NotImplementedError
 
@@ -441,12 +446,18 @@ def describe_hub_error(exc, operation, *secrets):
         category = {401: "authentication", 403: "permission", 404: "not_found", 408: "connectivity",
                     409: "conflict", 412: "conflict", 413: "payload_too_large",
                     429: "rate_limit"}.get(status, "server" if status >= 500 else "api_request")
+    retry_after = _header(response, "retry-after")
+    rate_limit = _header(response, "ratelimit")
+    if retry_after is None and rate_limit:
+        # Hub format (IETF draft): "api";r=0;t=<seconds until reset>
+        match = re.search(r"\bt=(\d+)", str(rate_limit))
+        retry_after = match.group(1) if match else None
     return dict(operation=operation, category=category, http_status=status,
                 exception_type=f"{type(exc).__module__}.{type(exc).__qualname__}",
                 exception_chain=[f"{type(e).__module__}.{type(e).__qualname__}" for e in chain[1:]],
                 server_message=redact(server_message, *secrets) if server_message else None,
                 request_id=_header(response, "x-request-id"), error_code=_header(response, "x-error-code"),
-                retry_after=_header(response, "retry-after"), message=message, hint=HUB_HINTS[category])
+                retry_after=retry_after, rate_limit=rate_limit, message=message, hint=HUB_HINTS[category])
 
 
 def hub_token_report(whoami, repo_id):
@@ -522,10 +533,17 @@ class HuggingFaceStore(SnapshotStore):
                         info) from None
                 delay = 2 ** attempt
                 if info["category"] == "rate_limit":
+                    # Waiting out a long limit here would stall encoding/training and further
+                    # retries keep the limit tripped; callers' deferred queue backs off instead.
                     try:
-                        delay = min(max(float(info["retry_after"]), 5), 120)
+                        delay = max(float(info["retry_after"]), 5)
                     except (TypeError, ValueError):
-                        delay = 30
+                        delay = None
+                    if delay is None or delay > 60:
+                        raise HubOperationError(
+                            f"Hugging Face {operation} rate limited (HTTP 429, retry-after "
+                            f"{info['retry_after']}): {info['server_message'] or info['message']}. {info['hint']}",
+                            info) from None
                 time.sleep(delay)
 
     def inspect_token(self):
@@ -585,6 +603,19 @@ class HuggingFaceStore(SnapshotStore):
                    commit_message=f"Save {self.prefix}/{relative}", run_as_future=False)
         if self._files is not None:
             self._files.add(relative)
+
+    def put_many(self, items):
+        # One commit for many files: Hub limits commits separately from API requests.
+        items = list(items)
+        if not items:
+            return
+        operations = [self._commit_add(path_in_repo=self._path(relative), path_or_fileobj=str(local))
+                      for local, relative in items]
+        self._call("batch upload", self.api.create_commit, repo_id=self.repo_id, repo_type="model",
+                   operations=operations, commit_message=f"Save {len(items)} files under {self.prefix}",
+                   run_as_future=False)
+        if self._files is not None:
+            self._files.update(relative for _, relative in items)
 
     def get(self, relative, local):
         import shutil
