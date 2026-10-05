@@ -4,7 +4,7 @@ import logging
 import time
 from pathlib import Path
 
-from orpheus_utils import atomic_json, read_json, sha256, verify_checkpoint
+from orpheus_utils import atomic_json, read_json, redact, sha256, verify_checkpoint
 
 LOG = logging.getLogger('orpheus_urdu')
 
@@ -52,6 +52,15 @@ class DeferredUploads:
         self.path = self.run / 'pending_uploads.json'
         self.queue = self.load_queue()
         self.next_attempt = 0
+        self.last_upload_error = None
+
+    def _failed(self, stage, exc):
+        # Redacted reason is kept so backup_status.json explains why state is LOCAL only.
+        self.next_attempt = self.clock() + 60
+        self.last_upload_error = dict(stage=stage, exception_type=type(exc).__name__, message=redact(exc, limit=600),
+                                      category=getattr(exc, 'diagnostics', {}).get('category'),
+                                      time=time.time())
+        return self.last_upload_error['message']
 
     def __getattr__(self, name):
         return getattr(self.store, name)
@@ -91,7 +100,7 @@ class DeferredUploads:
         atomic_json(self.path, self.queue)
         atomic_json(self.run / 'backup_status.json', dict(
             remote_configured=bool(self.remote), pending_files=len(self.queue['files']),
-            pending_checkpoint=self.queue['checkpoint'],
+            pending_checkpoint=self.queue['checkpoint'], last_upload_error=self.last_upload_error,
             remote_snapshot_current=bool(self.remote and self.queue.get('last_uploaded_checkpoint') and self.queue['checkpoint'] is None)))
 
     def put(self, local, relative):
@@ -103,8 +112,8 @@ class DeferredUploads:
                 self.store.put(local, relative)
                 self.queue['files'].pop(relative, None)
             except Exception as exc:
-                self.next_attempt = self.clock() + 60
-                LOG.warning('Upload deferred (%s); local artifact retained: %s', type(exc).__name__, relative)
+                reason = self._failed('file upload', exc)
+                LOG.warning('Upload deferred (%s: %s); local artifact retained: %s', type(exc).__name__, reason, relative)
         self.save()
 
     def backup(self, run, checkpoint, *, force=False):
@@ -121,13 +130,14 @@ class DeferredUploads:
         try:
             self.store.backup(run, checkpoint)
         except Exception as exc:
-            self.next_attempt = self.clock() + 60
-            LOG.warning('Remote checkpoint upload deferred (%s). Verified checkpoint remains LOCAL at %s',
-                        type(exc).__name__, checkpoint)
+            reason = self._failed('checkpoint backup', exc)
+            LOG.warning('Remote checkpoint upload deferred (%s: %s). Verified checkpoint remains LOCAL at %s',
+                        type(exc).__name__, reason, checkpoint)
             self.save()
             return False
         self.queue['checkpoint'] = None
         self.queue['last_uploaded_checkpoint'] = Path(checkpoint).name
+        self.last_upload_error = None
         # Bound optional queue draining so an outage cannot consume the session.
         for relative, local in list(self.queue['files'].items())[:8]:
             if not Path(local).is_file():

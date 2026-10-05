@@ -381,7 +381,7 @@ Final validation loss is token cross entropy for the configured objective. It is
 | Problem | Action |
 |---|---|
 | Global `pip check` lists conflicts for Kaggle tools | Start a fresh session and use the venv setup in Cell 2; project dependency checks replace the global check. See Section 5. |
-| Hub preflight fails | Check `HF_TOKEN` Secret access, token write permission, repository ID/type, private visibility, storage allowance and Internet. Try `--mode storage-check` first. |
+| Hub preflight fails | The error now names a category (`authentication`, `permission`, `not_found`, `quota`, `rate_limit`, `connectivity`, `server`, ...), the HTTP status, the Hub's own message, the request ID and the token role from `whoami` (tokens are redacted). Run `HF_TOKEN=... python check_hub.py --repo USER/REPO` on any machine (needs only `pip install huggingface_hub`) to reproduce in seconds without Kaggle GPU time. Notebook Cell 1 runs the same check before installation. |
 | Missing Hub repo ID | Set `hf_repo_id`, `--hf-repo-id` or `ORPHEUS_HF_REPO` to `USERNAME/REPOSITORY`. |
 | Optional Drive preflight fails | Check notebook Secret access, OAuth expiry, remote name, Drive scope, quota and Internet. No GPU training begins before the probe succeeds. |
 | ZIP download fails | Check sharing and Drive download quota. Upload the extracted paired dataset as a private Kaggle Dataset and set `data_dir` to its `/kaggle/input/...` path. |

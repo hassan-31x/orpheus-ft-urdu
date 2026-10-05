@@ -356,6 +356,123 @@ class DriveStore(SnapshotStore):
                      "--exclude", "*.tmp*", *options)
 
 
+_SECRET_PATTERNS = (
+    re.compile(r"hf_[A-Za-z0-9]{6,}"),
+    re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\b(token|access_token|password|authorization)([=:]\s*)[^\s&\"',]+"),
+    re.compile(r"://[^/\s:@]+:[^/\s@]+@"),
+)
+
+
+def redact(text, *secrets, limit=800):
+    """Remove Hub tokens and auth headers before text reaches logs or reports."""
+    text = str(text)
+    for secret in secrets:
+        if secret and len(secret) >= 6:
+            text = text.replace(secret, "***")
+    text = _SECRET_PATTERNS[0].sub("hf_***", text)
+    text = _SECRET_PATTERNS[1].sub(lambda m: m.group(1) + " ***", text)
+    text = _SECRET_PATTERNS[2].sub(lambda m: m.group(1) + m.group(2) + "***", text)
+    text = _SECRET_PATTERNS[3].sub("://***@", text)
+    return text if len(text) <= limit else text[:limit] + "...[truncated]"
+
+
+HUB_HINTS = {
+    "authentication": "HF_TOKEN was rejected (invalid, expired, revoked or not sent). Create a new token and update the Kaggle Secret.",
+    "permission": "HF_TOKEN is valid but may not write to this repository. Use a 'write' token, or a fine-grained token with 'Write access to contents/settings of all repos' or this repo selected.",
+    "not_found": "Repository not visible to this token: check hf_repo_id spelling/owner and that a fine-grained token includes this repository.",
+    "quota": "Hub storage or usage quota appears exceeded; free space in the account or use a different repository.",
+    "rate_limit": "Hub rate limit reached; retry later or reduce commit frequency.",
+    "payload_too_large": "File exceeds a Hub request size limit.",
+    "conflict": "Concurrent Hub commit conflict; normally transient.",
+    "server": "Hugging Face server error; normally transient (see status.huggingface.co).",
+    "connectivity": "Network failure reaching huggingface.co: check Kaggle Internet setting, proxy/DNS and HF_ENDPOINT.",
+    "offline_mode": "HF_HUB_OFFLINE is set; unset it to allow uploads.",
+    "api_request": "Hub rejected the request; see server_message.",
+    "client_or_local": "Error raised locally by the Hub client before/without an HTTP response; see exception_type and message.",
+}
+_RETRYABLE = {"rate_limit", "conflict", "server", "connectivity", "client_or_local"}
+
+
+class HubOperationError(RuntimeError):
+    """Redacted Hub failure; .diagnostics holds JSON-safe evidence for reports."""
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
+def _header(response, name):
+    try:
+        return (getattr(response, "headers", None) or {}).get(name)
+    except Exception:
+        return None
+
+
+def describe_hub_error(exc, operation, *secrets):
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    status = status if isinstance(status, int) else None
+    server_message = getattr(exc, "server_message", None) or _header(response, "x-error-message")
+    if not server_message and response is not None:
+        try:
+            body = response.json()
+            server_message = body.get("error") if isinstance(body, dict) else None
+        except Exception:
+            server_message = None
+    chain, seen = [], exc
+    while seen is not None and len(chain) < 6:
+        chain.append(seen)
+        seen = seen.__cause__ or seen.__context__
+    names = [c.__name__ for e in chain for c in type(e).__mro__]
+    message = redact(exc, *secrets)
+    text = f"{server_message or ''} {message}".lower()
+    if status is None:
+        if "OfflineModeIsEnabled" in names:
+            category = "offline_mode"
+        elif any(k in n for n in names for k in ("ConnectionError", "ConnectError", "Timeout", "SSLError",
+                                                   "ProxyError", "NameResolution", "socket")):
+            category = "connectivity"
+        else:
+            category = "client_or_local"
+    elif status == 507 or any(k in text for k in ("quota", "storage limit", "insufficient storage",
+                                                    "exceeded your", "storage space")):
+        category = "quota"
+    else:
+        category = {401: "authentication", 403: "permission", 404: "not_found", 408: "connectivity",
+                    409: "conflict", 412: "conflict", 413: "payload_too_large",
+                    429: "rate_limit"}.get(status, "server" if status >= 500 else "api_request")
+    return dict(operation=operation, category=category, http_status=status,
+                exception_type=f"{type(exc).__module__}.{type(exc).__qualname__}",
+                exception_chain=[f"{type(e).__module__}.{type(e).__qualname__}" for e in chain[1:]],
+                server_message=redact(server_message, *secrets) if server_message else None,
+                request_id=_header(response, "x-request-id"), error_code=_header(response, "x-error-code"),
+                retry_after=_header(response, "retry-after"), message=message, hint=HUB_HINTS[category])
+
+
+def hub_token_report(whoami, repo_id):
+    """Summarise token scope from HfApi.whoami(); can_write None means undetermined."""
+    namespace = repo_id.split("/")[0]
+    access = ((whoami or {}).get("auth") or {}).get("accessToken") or {}
+    role = access.get("role")
+    orgs = [o.get("name") for o in (whoami or {}).get("orgs") or [] if isinstance(o, dict)]
+    report = dict(user=(whoami or {}).get("name"), token_role=role, token_name=access.get("displayName"),
+                  namespace_is_user_or_org=namespace in [(whoami or {}).get("name"), *orgs], can_write=None)
+    if role == "write":
+        report["can_write"] = True
+    elif role == "read":
+        report["can_write"] = False
+    elif role == "fineGrained":
+        scoped = (access.get("fineGrained") or {}).get("scoped") or []
+        grants = []
+        for entry in scoped:
+            entity = entry.get("entity") or {}
+            if entity.get("name") in (namespace, repo_id):
+                grants += entry.get("permissions") or []
+        report["fine_grained_permissions_for_repo"] = sorted(set(grants))
+        report["can_write"] = "repo.write" in grants
+    return report
+
+
 class HuggingFaceStore(SnapshotStore):
     """Private Hub model repo; synchronous commits and bounded transfer retries.
 
@@ -377,19 +494,57 @@ class HuggingFaceStore(SnapshotStore):
         super().__init__(f"hf://{repo_id}/{self.prefix}")
         self.api, self._download, self._commit_add = api, download, commit_add
         self._token, self._files = token, None
+        self.token_report, self.last_error = None, None
 
-    def _call(self, operation, function, *, missing_ok=False, **kwargs):
-        for attempt in range(3):
+    def _call(self, operation, function, *, missing_ok=False, attempts=3, **kwargs):
+        log = logging.getLogger("orpheus_urdu")
+        for attempt in range(1, attempts + 1):
             try:
                 return function(**kwargs)
             except Exception as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", None)
-                if missing_ok and status == 404:
+                info = describe_hub_error(exc, operation, self._token)
+                if missing_ok and info["http_status"] == 404:
                     return None
-                if status in (400, 401, 403, 404) or attempt == 2:
-                    # API exception strings/tracebacks may contain sensitive request fields.
-                    raise RuntimeError(f"Hugging Face {operation} failed; check HF_TOKEN write permission, repo access, storage quota and Internet") from None
-                time.sleep(2**attempt)
+                info["attempt"] = f"{attempt}/{attempts}"
+                if self.token_report and info["category"] in ("authentication", "permission", "not_found"):
+                    info["token_report"] = self.token_report
+                self.last_error = info
+                log.warning("Hugging Face %s attempt %d/%d failed: %s", operation, attempt, attempts,
+                            json.dumps(info, ensure_ascii=False))
+                if info["category"] not in _RETRYABLE or attempt == attempts:
+                    # Original traceback suppressed: request objects may carry auth headers.
+                    # The redacted evidence above and in .diagnostics replaces it.
+                    raise HubOperationError(
+                        f"Hugging Face {operation} failed [{info['category']}] HTTP {info['http_status']} "
+                        f"{info['exception_type']}: {info['server_message'] or info['message']} "
+                        f"(request id {info['request_id']}). {info['hint']}"
+                        + (f" Token scope: {json.dumps(self.token_report)}" if "token_report" in info else ""),
+                        info) from None
+                delay = 2 ** attempt
+                if info["category"] == "rate_limit":
+                    try:
+                        delay = min(max(float(info["retry_after"]), 5), 120)
+                    except (TypeError, ValueError):
+                        delay = 30
+                time.sleep(delay)
+
+    def inspect_token(self):
+        """Record token role/scope as evidence; never fatal except a rejected token."""
+        whoami = getattr(self.api, "whoami", None)
+        if whoami is None:
+            return None
+        try:
+            # One attempt: whoami is rate limited and this check is diagnostic only.
+            self.token_report = hub_token_report(self._call("token inspection", whoami, attempts=1), self.repo_id)
+        except HubOperationError as exc:
+            if exc.diagnostics["category"] == "authentication":
+                raise
+            return None
+        log = logging.getLogger("orpheus_urdu")
+        log.info("HF token: %s", json.dumps(self.token_report))
+        if self.token_report["can_write"] is False:
+            log.warning("HF_TOKEN appears unable to write to %s; the probe upload will confirm", self.repo_id)
+        return self.token_report
 
     def _path(self, relative):
         # Validate the remote artifact path as well as local extraction paths.
@@ -397,6 +552,22 @@ class HuggingFaceStore(SnapshotStore):
         return self.prefix + "/" + relative
 
     def preflight(self):
+        log = logging.getLogger("orpheus_urdu")
+        try:
+            import importlib.metadata as md
+            versions = {}
+            for name in ("huggingface_hub", "hf_xet", "hf_transfer", "requests", "httpx"):
+                try:
+                    versions[name] = md.version(name)
+                except md.PackageNotFoundError:
+                    versions[name] = None
+            env = {k: redact(os.environ[k]) for k in ("HF_ENDPOINT", "HF_HUB_OFFLINE", "HF_HUB_ENABLE_HF_TRANSFER",
+                                                     "HF_HUB_DISABLE_XET", "HTTPS_PROXY", "HTTP_PROXY")
+                   if k in os.environ}
+            log.info("Hub client: %s env=%s", versions, env)
+        except Exception:
+            pass
+        self.inspect_token()
         info = self._call("repository inspection", self.api.repo_info,
                           repo_id=self.repo_id, repo_type="model", missing_ok=True)
         if info is None:
