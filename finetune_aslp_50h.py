@@ -894,8 +894,10 @@ def main():
                                    if not (Path(__file__).parent / name).is_file()
                                    or sha256(Path(__file__).parent / name) != digest]
                 if changed_sources:
-                    raise RuntimeError(f"Verified {existing.name} requires its recorded source versions: {changed_sources}. "
-                                       "Use the preserved run/source files to resume; no audio processing was started")
+                    raise RuntimeError(f"Verified {existing.name} of run_id {cfg['run_id']} was made by different code "
+                                       f"({changed_sources}). To continue it, rerun with the commit that created it (REPO_REF); "
+                                       "to start fresh on this code, set a new RUN_ID_OVERRIDE. Nothing was deleted; "
+                                       "no audio processing was started")
             status = run / "status.json"
             if status.exists() and read_json(status).get("status") in ("complete", "smoke_complete"):
                 previous_cfg = read_json(run / "resolved_config.json")
