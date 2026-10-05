@@ -714,9 +714,16 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                 return
             self.samples(state)
             optional_plots(run)
-            # The required training snapshot is already secured. Sample refresh is optional.
+            # The required training snapshot is already secured. Upload only the new small
+            # monitoring files; a second full snapshot doubled per-checkpoint upload and storage.
             try:
-                store.backup(run, checkpoint)
+                step_dir = run / "samples" / f"step-{state.global_step:07d}"
+                items = [(p, "monitoring/" + p.relative_to(run).as_posix())
+                         for p in sorted(step_dir.glob("*")) if p.is_file()]
+                items += [(run / name, "monitoring/" + name) for name in
+                          ("status.json", "metrics.jsonl", "metrics.csv", "loss_and_lr.png", "sample_errors.jsonl")
+                          if (run / name).is_file()]
+                upload_files(store, items)
             except Exception as exc:
                 LOG.warning("Optional sample snapshot refresh failed (%s); training snapshot remains saved",
                             type(exc).__name__)

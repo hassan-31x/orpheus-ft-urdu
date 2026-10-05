@@ -120,6 +120,7 @@ class TrainingFlowTests(unittest.TestCase):
             writer.add_scalar.side_effect = OSError('event writer failed')
             modules['torch.utils.tensorboard'] = SimpleNamespace(SummaryWriter=lambda **kwargs: writer)
         backend = SimpleNamespace(remote='hf://private', put=Mock(), backup=Mock())
+        self.backend = backend
         store = DeferredUploads(backend, run)
         with patch.dict('sys.modules', modules), patch.object(pipeline, 'optional_plots'):
             pipeline.train(cfg, ds, tokenizer, splits, run, store, {'config': cfg}, pipeline.time.monotonic())
@@ -134,6 +135,12 @@ class TrainingFlowTests(unittest.TestCase):
             self.assertTrue((run / 'checkpoint-1' / 'COMPLETE.json').exists())
             self.assertTrue((run / 'adapter_final' / 'adapter_model.safetensors').exists())
             self.assertTrue(json.loads((run / 'backup_status.json').read_text())['remote_snapshot_current'])
+            # One full snapshot per saved checkpoint (+ the final forced backup); sample
+            # refreshes upload small monitoring files instead of a second full snapshot.
+            snapshots = [Path(c.args[1]).name for c in self.backend.backup.call_args_list]
+            self.assertEqual(snapshots, sorted(set(snapshots), key=snapshots.index) + snapshots[-1:])
+            monitored = [c.args[1] for c in self.backend.put.call_args_list]
+            self.assertIn('monitoring/status.json', monitored)
 
     def test_optional_evaluation_failure_keeps_completed_adapter(self):
         with tempfile.TemporaryDirectory() as directory:

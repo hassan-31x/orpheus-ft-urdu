@@ -182,7 +182,7 @@ After verifying the smoke run, use `configs/aslp50h.json` with `max_steps=-1`. D
 | Sequence limit | 2048; record context-overflow exclusions without truncating |
 | Loss | all sequence tokens; padding ignored |
 | Frame removal | none |
-| Checkpoint / periodic validation | every 100 optimizer steps |
+| Checkpoint / periodic validation | checkpoint at step 1, every 250 optimizer steps and at completion; validation every 100 steps |
 | Periodic validation | fixed 256-row subset; full validation at completion |
 | Samples | 3 fixed validation prompts at initialization and saves |
 | Local checkpoint retention | 3 |
