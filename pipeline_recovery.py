@@ -435,3 +435,91 @@ def compatible_encoding_identity(previous, current, previous_source, current_sou
         return current
     LOG.info('Token-producing code, data and settings match; reusing the existing encoded-cache identity')
     return previous
+
+
+ACTIVITY = {'stage': 'starting', 'since': time.time(), 'step': None}
+
+
+def set_activity(stage, step=None):
+    """Record what the run is doing; the heartbeat reports it if progress stalls."""
+    ACTIVITY.update(stage=stage, since=time.time())
+    if step is not None:
+        ACTIVITY['step'] = step
+
+
+def _tail(path, lines):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 256 * 1024))
+            return b'\n'.join(f.read().splitlines()[-lines:]).decode('utf-8', 'replace')
+    except OSError:
+        return ''
+
+
+class Heartbeat:
+    """Unattended-run evidence independent of the Kaggle log viewer.
+
+    Every `stack_interval` seconds faulthandler appends all thread stacks to
+    stacks.log (C-level timer: works even if Python threads are stuck). Every
+    `interval` seconds a small status bundle is committed to monitoring/ on the
+    remote, so a stalled run shows its stage and stack on Hugging Face.
+    """
+    def __init__(self, run, store, interval=600, stack_interval=600):
+        import threading
+        self.run, self.store = Path(run), store
+        self.interval, self.stack_interval = interval, stack_interval
+        self._stop = threading.Event()
+        self._stacks = None
+
+    def start(self):
+        import faulthandler
+        import threading
+        try:
+            self._stacks = open(self.run / 'stacks.log', 'a')
+            faulthandler.dump_traceback_later(self.stack_interval, repeat=True, file=self._stacks)
+        except Exception as exc:
+            LOG.warning('Optional stack watchdog unavailable (%s)', type(exc).__name__)
+        threading.Thread(target=self._loop, name='heartbeat', daemon=True).start()
+        return self
+
+    def _loop(self):
+        # First beat early so a short/test run shows up on the remote quickly.
+        wait = min(120, self.interval)
+        while not self._stop.wait(wait):
+            self.beat()
+            wait = self.interval
+
+    def beat(self):
+        try:
+            import shutil
+            now = time.time()
+            folder = self.run / 'monitoring'
+            folder.mkdir(exist_ok=True)
+            atomic_json(folder / 'heartbeat.json', dict(
+                time=now, utc=time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(now)),
+                stage=ACTIVITY['stage'], seconds_in_stage=round(now - ACTIVITY['since']),
+                step=ACTIVITY['step'], disk_free_gib=round(shutil.disk_usage(self.run).free / 2**30, 2)))
+            (folder / 'run_tail.log').write_text(_tail(self.run / 'run.log', 400), encoding='utf-8')
+            (folder / 'stacks_tail.log').write_text(_tail(self.run / 'stacks.log', 300), encoding='utf-8')
+            items = [(folder / name, 'monitoring/' + name) for name in
+                     ('heartbeat.json', 'run_tail.log', 'stacks_tail.log')]
+            items += [(self.run / name, 'monitoring/' + name) for name in ('metrics.jsonl', 'backup_status.json')
+                      if (self.run / name).is_file()]
+            if self.store.remote:
+                # Raw store, own upload lane: never blocks, defers or alters checkpoint uploads.
+                self.store.put_many(items, lane='heartbeat')
+        except Exception as exc:
+            LOG.warning('Optional heartbeat upload failed (%s)', type(exc).__name__)
+
+    def stop(self, final_beat=True):
+        import faulthandler
+        if final_beat and not self._stop.is_set():
+            self.beat()
+        self._stop.set()
+        try:
+            faulthandler.cancel_dump_traceback_later()
+            if self._stacks:
+                self._stacks.close()
+        except Exception:
+            pass

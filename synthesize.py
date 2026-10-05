@@ -14,7 +14,7 @@ from orpheus_utils import CODEC_ID, SPECIAL, atomic_json, decode_frames, prompt_
 
 def generate_audio(model, tokenizer, text, output, *, speaker=None, seed=3407,
                    max_length=2048, max_new_tokens=1400, temperature=0.6,
-                   top_p=0.95, repetition_penalty=1.1, codec_revision="main"):
+                   top_p=0.95, repetition_penalty=1.1, codec_revision="main", max_time=None):
     import torch
     import soundfile as sf
     from snac import SNAC
@@ -33,7 +33,7 @@ def generate_audio(model, tokenizer, text, output, *, speaker=None, seed=3407,
                                 max_new_tokens=budget, do_sample=True, temperature=temperature,
                                 top_p=top_p, repetition_penalty=repetition_penalty,
                                 eos_token_id=SPECIAL["end_speech"], pad_token_id=SPECIAL["pad"],
-                                use_cache=True)
+                                use_cache=True, **({"max_time": max_time} if max_time else {}))
     ids = result[0, len(prefix):].cpu().tolist()
     atomic_json(output.with_suffix(".tokens.json"), ids)
     codes, status = decode_frames(ids)

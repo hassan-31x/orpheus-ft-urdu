@@ -234,7 +234,7 @@ class SnapshotStore:
         if self.remote:
             raise NotImplementedError
 
-    def put_many(self, items):
+    def put_many(self, items, lane="files"):
         """Upload [(local, relative), ...]; Hub overrides this with one commit."""
         for local, relative in items:
             self.put(local, relative)
@@ -395,6 +395,7 @@ HUB_HINTS = {
     "offline_mode": "HF_HUB_OFFLINE is set; unset it to allow uploads.",
     "api_request": "Hub rejected the request; see server_message.",
     "client_or_local": "Error raised locally by the Hub client before/without an HTTP response; see exception_type and message.",
+    "timeout": "Upload exceeded its time limit (stalled connection or very slow transfer); it stays queued locally and is retried later.",
 }
 _RETRYABLE = {"rate_limit", "conflict", "server", "connectivity", "client_or_local"}
 
@@ -506,6 +507,44 @@ class HuggingFaceStore(SnapshotStore):
         self.api, self._download, self._commit_add = api, download, commit_add
         self._token, self._files = token, None
         self.token_report, self.last_error = None, None
+        self._inflight = {}
+
+    # Hub/Xet transfers have no overall deadline; a stalled one must not freeze training.
+    UPLOAD_TIMEOUTS = {"checkpoint": 1800, "files": 600, "heartbeat": 300}
+
+    def _bounded(self, lane, operation, function):
+        import threading
+        previous = self._inflight.get(lane)
+        if previous is not None and previous.is_alive():
+            raise HubOperationError(f"Hugging Face {operation} skipped: the previous {lane} upload is still "
+                                    "running in the background", self._timeout_info(operation, still_running=True))
+        result = {}
+
+        def work():
+            try:
+                result["value"] = function()
+            except BaseException as exc:
+                result["error"] = exc
+        thread = threading.Thread(target=work, name=f"hub-{lane}", daemon=True)
+        self._inflight[lane] = thread
+        thread.start()
+        thread.join(self.UPLOAD_TIMEOUTS[lane])
+        if thread.is_alive():
+            info = self._timeout_info(operation)
+            self.last_error = info
+            logging.getLogger("orpheus_urdu").warning("Hugging Face %s timed out: %s", operation, json.dumps(info))
+            raise HubOperationError(f"Hugging Face {operation} timed out after {self.UPLOAD_TIMEOUTS[lane]}s. "
+                                    f"{HUB_HINTS['timeout']}", info)
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def _timeout_info(self, operation, still_running=False):
+        return dict(operation=operation, category="timeout", http_status=None, exception_type="TimeoutError",
+                    exception_chain=[], server_message=None, request_id=None, error_code=None,
+                    retry_after=None, rate_limit=None, still_running=still_running,
+                    message="previous upload still running" if still_running else "upload deadline exceeded",
+                    hint=HUB_HINTS["timeout"])
 
     def _call(self, operation, function, *, missing_ok=False, attempts=3, **kwargs):
         log = logging.getLogger("orpheus_urdu")
@@ -604,16 +643,17 @@ class HuggingFaceStore(SnapshotStore):
         if self._files is not None:
             self._files.add(relative)
 
-    def put_many(self, items):
+    def put_many(self, items, lane="files"):
         # One commit for many files: Hub limits commits separately from API requests.
         items = list(items)
         if not items:
             return
         operations = [self._commit_add(path_in_repo=self._path(relative), path_or_fileobj=str(local))
                       for local, relative in items]
-        self._call("batch upload", self.api.create_commit, repo_id=self.repo_id, repo_type="model",
-                   operations=operations, commit_message=f"Save {len(items)} files under {self.prefix}",
-                   run_as_future=False)
+        self._bounded(lane, "batch upload", lambda: self._call(
+            "batch upload", self.api.create_commit, repo_id=self.repo_id, repo_type="model",
+            operations=operations, commit_message=f"Save {len(items)} files under {self.prefix}",
+            run_as_future=False))
         if self._files is not None:
             self._files.update(relative for _, relative in items)
 
@@ -656,7 +696,7 @@ class HuggingFaceStore(SnapshotStore):
                 if relative.parts[0].startswith("checkpoint-") and relative.parts[0] != checkpoint.name:
                     continue
                 source = path
-                if relative.parts[0] == "tensorboard" or str(relative) == "run.log":
+                if relative.parts[0] in ("tensorboard", "monitoring") or str(relative) in ("run.log", "stacks.log"):
                     source = contained(Path(d) / "evidence", str(relative))
                     source.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(path, source)
@@ -673,9 +713,12 @@ class HuggingFaceStore(SnapshotStore):
                           path_or_fileobj=str(paths[name])) for name, entry in info["files"].items()]
             operations.append(self._commit_add(path_in_repo=self._path("latest.json"),
                                                path_or_fileobj=str(pointer)))
-            self._call("checkpoint commit", self.api.create_commit, repo_id=self.repo_id,
-                       repo_type="model", operations=operations,
-                       commit_message=f"Checkpoint {self.prefix}: {checkpoint.name}", run_as_future=False)
+            # If this times out, the commit may still land later (atomically, pointer included);
+            # the lane guard stops a newer checkpoint racing it until it finishes.
+            self._bounded("checkpoint", "checkpoint commit", lambda: self._call(
+                "checkpoint commit", self.api.create_commit, repo_id=self.repo_id,
+                repo_type="model", operations=operations,
+                commit_message=f"Checkpoint {self.prefix}: {checkpoint.name}", run_as_future=False))
         if self._files is not None:
             self._files.update(entry["path"] for entry in info["files"].values())
             self._files.add("latest.json")

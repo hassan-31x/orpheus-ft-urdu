@@ -29,7 +29,7 @@ from orpheus_utils import (
     seal_checkpoint, sha256, training_row,
 )
 
-from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation, checkpoint_budget, ensure_checkpoint_space, save_with_space_retry, reconcile_run_identity, optional_action, export_checkpoint_adapter, compatible_encoding_identity
+from pipeline_recovery import Heartbeat, set_activity, DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation, checkpoint_budget, ensure_checkpoint_space, save_with_space_retry, reconcile_run_identity, optional_action, export_checkpoint_adapter, compatible_encoding_identity
 
 LOG = logging.getLogger("orpheus_urdu")
 DEFAULTS = Path(__file__).parent / "configs/aslp50h.json"
@@ -473,6 +473,7 @@ def encode_data(root, splits, cfg, tokenizer, vocab_size, cache, store, cache_id
                     info = dict(row_identity=chunk_identity, rows=len(encoded), excluded=excluded, sha256=sha256(path))
                     atomic_json(meta, info)
                     LOG.info("Encoded %s %d/%d", split, start+len(subset), len(rows))
+                    set_activity(f"encoding {split} {start+len(subset)}/{len(rows)}")
                 # Upload chunks missing remotely (including ones a previous upload lost), in batches.
                 for local in (path, meta):
                     relative = f"cache/{cache_id}/{split}/{local.name}"
@@ -649,6 +650,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                 raise FloatingPointError("Nonfinite training loss recorded; stopping before publishing another checkpoint")
 
         def on_step_end(self, args, state, control, **kwargs):
+            set_activity("training", state.global_step)
             remaining = cfg["session_hours"]*3600 - (time.monotonic()-session_start)
             # Budget includes preparation and downloads. Leave time for samples/upload.
             if stop_requested[0] or remaining < 900:
@@ -669,6 +671,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                     FastLanguageModel.for_inference(model)
                     for i, row in enumerate(samples):
                         dest = run / "samples" / f"step-{state.global_step:07d}" / f"sample-{i:02d}.wav"
+                        set_activity(f"generating sample {i+1}/{len(samples)} after checkpoint-{state.global_step}")
                         try:
                             metadata = generate_audio(model, tokenizer, row["text"], dest,
                                                       speaker=row["speaker"], seed=cfg["seed"]+i,
@@ -677,7 +680,8 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                                                       temperature=cfg["sample_temperature"],
                                                       top_p=cfg["sample_top_p"],
                                                       repetition_penalty=cfg["sample_repetition_penalty"],
-                                                      codec_revision=cfg["codec_revision"])
+                                                      codec_revision=cfg["codec_revision"],
+                                                      max_time=cfg["sample_max_seconds"])
                             metadata.update(reference_audio=row["audio"], step=state.global_step)
                             atomic_json(dest.with_suffix(".json"), metadata)
                         except Exception as e:
@@ -708,6 +712,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             optional_action(lambda: atomic_json(run / "status.json", dict(status="checkpoint_saved", step=state.global_step,
                                                   epoch=state.epoch, timestamp=time.time())), stage="checkpoint status")
             # Upload before plots/synthesis; skip optional work near session cutoff.
+            set_activity(f"uploading {checkpoint.name}", state.global_step)
             uploaded = store.backup(run, checkpoint)
             if cfg["session_hours"]*3600 - (time.monotonic()-session_start) < 900:
                 LOG.info("Skipping optional samples/plots near session cutoff; checkpoint secured locally")
@@ -763,6 +768,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     monitor = Monitor()
     class ResilientTrainer(Trainer):
         def _save_checkpoint(self, model, trial):
+            set_activity(f"saving checkpoint-{self.state.global_step}", self.state.global_step)
             check_disk()
             def recover():
                 import shutil
@@ -779,6 +785,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             return super(ResilientTrainer, self).save_model(*args, **kwargs)
 
         def evaluate(self, *args, **kwargs):
+            set_activity("validation", self.state.global_step)
             def cleanup():
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -812,6 +819,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
         trainer._save_checkpoint(model, None)
         monitor.on_save(arguments, trainer.state, trainer.control)
         cp = latest_checkpoint(run)
+    set_activity("exporting final adapter")
     final = export_checkpoint_adapter(cp, run / "adapter_final")
     tokenizer.save_pretrained(final)
     atomic_json(final / "run_identity.json", identity)
@@ -826,7 +834,9 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     cp = latest_checkpoint(run)
     if not cp:
         raise RuntimeError("No resumable final checkpoint was created")
+    set_activity("final upload")
     store.backup(run, cp, force=True)
+    set_activity("finished")
     LOG.info("Finished; adapter at %s", final)
 
 
@@ -866,6 +876,10 @@ def main():
             if args.mode == "storage-check":
                 LOG.info("Storage preflight passed; no dataset download or GPU training requested")
                 return
+            # Stage/stack/log evidence on the remote every 10 min, independent of Kaggle logs.
+            import atexit
+            heartbeat = Heartbeat(run, store.store).start()
+            atexit.register(heartbeat.stop)
             if args.mode == "audit":
                 # CPU-only dataset inspection; no model imports, SNAC or tokenization.
                 root = find_data(cfg, work)
