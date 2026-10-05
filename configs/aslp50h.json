@@ -40,7 +40,7 @@
   "sample_temperature": 0.6,
   "sample_top_p": 0.95,
   "sample_repetition_penalty": 1.1,
-  "sample_at_start": true,
+  "sample_at_start": false,
   "session_hours": 25,
   "minimum_train_hours": 35,
   "maximum_clip_seconds": 60,

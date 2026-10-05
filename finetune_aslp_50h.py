@@ -29,7 +29,7 @@ from orpheus_utils import (
     seal_checkpoint, sha256, training_row,
 )
 
-from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation, checkpoint_budget, ensure_checkpoint_space, save_with_space_retry, reconcile_run_identity
+from pipeline_recovery import DeferredUploads, retry_io, valid_chunk, memory_selection, optional_evaluation, checkpoint_budget, ensure_checkpoint_space, save_with_space_retry, reconcile_run_identity, optional_action, export_checkpoint_adapter, compatible_encoding_identity
 
 LOG = logging.getLogger("orpheus_urdu")
 DEFAULTS = Path(__file__).parent / "configs/aslp50h.json"
@@ -521,7 +521,8 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     save_bytes = checkpoint_budget(model)
     def check_disk():
         pending = getattr(store, 'queue', {}).get('checkpoint')
-        return ensure_checkpoint_space(run, save_bytes, remote=bool(store.remote), protected=[pending])
+        return ensure_checkpoint_space(run, save_bytes, remote=bool(store.remote), protected=[pending],
+                                       archive_snapshots=getattr(store, "archive_snapshots", True))
     check_disk()  # Before any optimizer steps, including on fresh runs.
     previous = latest_checkpoint(run)
     def probe_memory(row):
@@ -595,8 +596,16 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                           ram_gb=psutil.Process().memory_info().rss/2**30)
             record.update(clean)
             record["nonfinite_metrics"] = ",".join(k for k, v in scalar.items() if not math.isfinite(v))
-            append_jsonl(run / "metrics.jsonl", record)
-            atomic_json(run / "status.json", dict(status="training", **record))
+            optional_action(lambda: append_jsonl(run / "metrics.jsonl", record), stage="JSONL metrics")
+            optional_action(lambda: atomic_json(run / "status.json", dict(status="training", **record)), stage="training status")
+            if tensorboard[0] is not None:
+                try:
+                    for key, value in clean.items():
+                        if value is not None:
+                            tensorboard[0].add_scalar(key, value, state.global_step)
+                except Exception as exc:
+                    LOG.warning("Disabling optional TensorBoard after %s", type(exc).__name__)
+                    tensorboard[0] = None
             if "loss" in scalar and not math.isfinite(scalar["loss"]):
                 raise FloatingPointError("Nonfinite training loss recorded; stopping before publishing another checkpoint")
 
@@ -634,8 +643,11 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                             atomic_json(dest.with_suffix(".json"), metadata)
                         except Exception as e:
                             LOG.exception("Monitoring synthesis failed; checkpoint remains the priority")
-                            append_jsonl(run / "sample_errors.jsonl",
-                                         dict(step=state.global_step, sample=i, error=str(e)))
+                            optional_action(lambda: append_jsonl(run / "sample_errors.jsonl",
+                                         dict(step=state.global_step, sample=i, error=str(e))), stage="sample error log")
+            except Exception as exc:
+                # Inference setup is optional too; always restore training mode below.
+                LOG.warning("Optional monitoring setup failed (%s); continuing training", type(exc).__name__)
             finally:
                 random.setstate(py_state)
                 np.random.set_state(np_state)
@@ -654,11 +666,13 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             tokenizer.save_pretrained(checkpoint)
             atomic_json(checkpoint / "run_identity.json", identity)
             seal_checkpoint(checkpoint)
-            atomic_json(run / "status.json", dict(status="checkpoint_saved", step=state.global_step,
-                                                  epoch=state.epoch, timestamp=time.time()))
-            # First secure training state. Optional samples cannot delay the first upload.
-            optional_plots(run)
+            optional_action(lambda: atomic_json(run / "status.json", dict(status="checkpoint_saved", step=state.global_step,
+                                                  epoch=state.epoch, timestamp=time.time())), stage="checkpoint status")
+            # Upload before plots/synthesis; skip optional work near session cutoff.
             uploaded = store.backup(run, checkpoint)
+            if cfg["session_hours"]*3600 - (time.monotonic()-session_start) < 900:
+                LOG.info("Skipping optional samples/plots near session cutoff; checkpoint secured locally")
+                return
             self.samples(state)
             optional_plots(run)
             # The required training snapshot is already secured. Sample refresh is optional.
@@ -667,20 +681,21 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             except Exception as exc:
                 LOG.warning("Optional sample snapshot refresh failed (%s); training snapshot remains saved",
                             type(exc).__name__)
-                append_jsonl(run / "optional_errors.jsonl", dict(stage="sample_snapshot_refresh",
-                                                               error=str(exc)))
+                optional_action(lambda: append_jsonl(run / "optional_errors.jsonl", dict(stage="sample_snapshot_refresh",
+                                                               error=str(exc))), stage="sample snapshot error log")
             LOG.info("Checkpoint %s verified locally; remote upload status: %s", checkpoint.name,
                      "local only" if not store.remote else ("uploaded" if uploaded else "pending (see backup_status.json)"))
 
-    reporting = ["tensorboard"]
+    # Own the optional writer so a runtime TensorBoard error cannot abort Trainer.
+    reporting = []
+    tensorboard = [None]
     try:
         from torch.utils.tensorboard import SummaryWriter
-        writer = SummaryWriter(log_dir=str(run / "tensorboard"))
-        writer.close()
+        tensorboard[0] = SummaryWriter(log_dir=str(run / "tensorboard"))
     except Exception as exc:
         reporting = []
         LOG.warning("Optional TensorBoard unavailable (%s); canonical JSONL metrics remain enabled", type(exc).__name__)
-        append_jsonl(run / "optional_errors.jsonl", dict(stage="tensorboard", error=type(exc).__name__))
+        optional_action(lambda: append_jsonl(run / "optional_errors.jsonl", dict(stage="tensorboard", error=type(exc).__name__)), stage="TensorBoard error log")
 
     arguments = TrainingArguments(
         output_dir=str(run), num_train_epochs=1, max_steps=cfg["max_steps"],
@@ -691,7 +706,7 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
         optim=cfg["optimizer"], fp16=not is_bfloat16_supported(), bf16=is_bfloat16_supported(),
         eval_strategy="steps", eval_steps=cfg["eval_steps"], prediction_loss_only=True,
         save_strategy="steps", save_steps=cfg["save_steps"],
-        save_total_limit=cfg["save_total_limit"], save_only_model=False,
+        save_total_limit=max(2, cfg["save_total_limit"]), save_only_model=False,
         logging_steps=cfg["logging_steps"], logging_first_step=True, logging_nan_inf_filter=False,
         report_to=reporting, logging_dir=str(run / "tensorboard"),
         group_by_length=cfg["sampling"] == "length", length_column_name="length",
@@ -733,8 +748,10 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
     if previous and read_json(previous / "run_identity.json") != identity:
         raise RuntimeError("Checkpoint run identity changed; use a new run_id for an ablation")
     result = trainer.train(resume_from_checkpoint=str(previous) if previous else None)
-    trainer.save_metrics("train", result.metrics)
-    trainer.save_state()
+    optional_action(lambda: trainer.save_metrics("train", result.metrics), stage="train metrics export")
+    optional_action(lambda: trainer.save_state(), stage="root Trainer state export")
+    if tensorboard[0] is not None:
+        optional_action(lambda: tensorboard[0].close(), stage="TensorBoard close")
     reached_schedule = trainer.state.global_step >= trainer.state.max_steps
     if not reached_schedule:
         atomic_json(run / "status.json", dict(status="paused_for_resume", step=trainer.state.global_step,
@@ -744,13 +761,17 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
             store.backup(run, cp)
         LOG.info("Session ended safely. Rerun identical command/config to continue the SAME epoch")
         return
-    final = run / "adapter_final"
-    trainer.save_model(final)
+    cp = latest_checkpoint(run)
+    if cp is None or cp.name != f"checkpoint-{trainer.state.global_step}":
+        trainer._save_checkpoint(model, None)
+        monitor.on_save(arguments, trainer.state, trainer.control)
+        cp = latest_checkpoint(run)
+    final = export_checkpoint_adapter(cp, run / "adapter_final")
     tokenizer.save_pretrained(final)
     atomic_json(final / "run_identity.json", identity)
     atomic_json(final / "resolved_config.json", cfg)
     metrics = trainer.evaluate(eval_dataset=ds["validation"], metric_key_prefix="full_validation")
-    trainer.save_metrics("validation", metrics)
+    optional_action(lambda: trainer.save_metrics("validation", metrics), stage="validation metrics export")
     atomic_json(run / "status.json", dict(status="smoke_complete" if cfg["max_steps"] > 0 else "complete",
                                           step=trainer.state.global_step, epoch=trainer.state.epoch,
                                           validation=metrics))
@@ -807,6 +828,15 @@ def main():
                 LOG.info("Dataset audit passed. No model loaded or training started")
                 return
             store.restore(run)
+            existing = latest_checkpoint(run)
+            if existing is not None:
+                previous_identity = read_json(existing / "run_identity.json")
+                changed_sources = [name for name, digest in previous_identity.get("source_sha256", {}).items()
+                                   if not (Path(__file__).parent / name).is_file()
+                                   or sha256(Path(__file__).parent / name) != digest]
+                if changed_sources:
+                    raise RuntimeError(f"Verified {existing.name} requires its recorded source versions: {changed_sources}. "
+                                       "Use the preserved run/source files to resume; no audio processing was started")
             status = run / "status.json"
             if status.exists() and read_json(status).get("status") in ("complete", "smoke_complete"):
                 previous_cfg = read_json(run / "resolved_config.json")
@@ -860,6 +890,10 @@ def main():
                                   max_length=cfg["max_length"], objective=cfg["objective"], dedup=cfg["dedup"],
                                   special=SPECIAL, audio_base=AUDIO_BASE,
                                   splits={s: fingerprint(rows) for s, rows in splits.items()})
+            old_format = run / "token_format.json"
+            if old_format.exists():
+                token_identity = compatible_encoding_identity(
+                    read_json(old_format), token_identity, run / "source", Path(__file__).parent)
             cache_id = fingerprint(token_identity)
             env, freeze, gpu = environment(run)
             # Same code, dependency versions, sequence order, schedule, objective and batch geometry.
@@ -878,15 +912,22 @@ def main():
             import shutil
             sources = run / "source"
             sources.mkdir(exist_ok=True)
-            for name in identity["source_sha256"]:
-                shutil.copy2(Path(__file__).parent / name, sources / name)
-            shutil.copy2(Path(__file__).parent / "evaluate_asr.py", sources / "evaluate_asr.py")
+            for name in (*identity["source_sha256"], "evaluate_asr.py"):
+                original, captured = Path(__file__).parent / name, sources / name
+                if original.resolve() != captured.resolve():
+                    shutil.copy2(original, captured)
+            (sources / "configs").mkdir(exist_ok=True)
+            if DEFAULTS.resolve() != (sources / "configs/aslp50h.json").resolve():
+                shutil.copy2(DEFAULTS, sources / "configs/aslp50h.json")
             atomic_json(identity_path, identity)
             atomic_json(run / "resolved_config.json", cfg)
             atomic_json(run / "token_format.json", token_identity)
             for p in (identity_path, run / "resolved_config.json", run / "dataset_report.json",
-                      run / "requirements-resolved.txt", run / "environment.json"):
+                      run / "requirements-resolved.txt", run / "environment.json", run / "token_format.json"):
                 store.put(p, "preparation/" + p.name)
+            for source in sorted(sources.rglob("*")):
+                if source.is_file() and source.suffix in (".py", ".json"):
+                    store.put(source, "preparation/source/" + str(source.relative_to(sources)))
             # Preparation metadata and immutable chunks also resume before the first checkpoint.
             cache = work / "cache" / cache_id
             ds = encode_data(root, splits, cfg, tokenizer, model_config.vocab_size, cache, store, cache_id, run)

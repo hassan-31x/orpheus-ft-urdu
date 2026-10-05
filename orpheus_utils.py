@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -180,7 +181,12 @@ def verify_checkpoint(checkpoint):
     marker = checkpoint / "COMPLETE.json"
     if not marker.is_file():
         return False
-    for relative, digest in read_json(marker)["files"].items():
+    files = read_json(marker)["files"]
+    required = {"adapter_config.json", "adapter_model.safetensors", "trainer_state.json",
+                "optimizer.pt", "scheduler.pt", "training_args.bin", "rng_state.pth"}
+    if not isinstance(files, dict) or not required <= set(files):
+        raise RuntimeError(f"Incomplete checkpoint manifest: {checkpoint}")
+    for relative, digest in files.items():
         p = contained(checkpoint, relative)
         if not p.is_file() or sha256(p) != digest:
             raise RuntimeError(f"Checkpoint checksum failed: {p}")
@@ -188,11 +194,22 @@ def verify_checkpoint(checkpoint):
 
 
 def latest_checkpoint(run):
-    candidates = sorted(Path(run).glob("checkpoint-*"),
+    candidates = sorted((p for p in Path(run).glob("checkpoint-*")
+                         if p.is_dir() and p.name.split("-")[-1].isdigit()),
                         key=lambda p: int(p.name.split("-")[-1]), reverse=True)
+    damaged = []
     for p in candidates:
-        if verify_checkpoint(p):
-            return p
+        try:
+            if verify_checkpoint(p):
+                if damaged:
+                    logging.getLogger("orpheus_urdu").warning(
+                        "Ignoring damaged checkpoints %s; resuming verified %s", damaged, p.name)
+                return p
+        except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+            damaged.append(p.name)
+    if damaged:
+        raise RuntimeError(f"No verified checkpoint remains; damaged candidates: {damaged}. "
+                           "Restore a remote copy before resuming")
     return None
 
 
@@ -280,7 +297,7 @@ class SnapshotStore:
             raise RuntimeError("Refusing to upload incomplete checkpoint")
         with tempfile.TemporaryDirectory(dir=run.parent) as d:
             archive = Path(d) / "snapshot.tar.gz"
-            with tarfile.open(archive, "w:gz", compresslevel=1) as t:
+            with tarfile.open(archive, "w:gz", compresslevel=1, dereference=True) as t:
                 for p in sorted(run.iterdir()):
                     if p.name.startswith("checkpoint-") and p != checkpoint:
                         continue
@@ -408,7 +425,7 @@ class HuggingFaceStore(SnapshotStore):
             downloaded = self._call("download", self._download, repo_id=self.repo_id,
                                     repo_type="model", filename=self._path(relative),
                                     token=self._token, local_dir=d)
-            shutil.copy2(downloaded, local)
+            Path(downloaded).replace(local)
 
     def names(self):
         if self._files is None:
@@ -417,6 +434,81 @@ class HuggingFaceStore(SnapshotStore):
             prefix = self.prefix + "/"
             self._files = {p[len(prefix):] for p in files if p.startswith(prefix)}
         return sorted(self._files)
+
+    # Hub commits can publish files and the pointer atomically without a tar copy.
+    archive_snapshots = False
+
+    def backup(self, run, checkpoint):
+        import shutil
+        run, checkpoint = Path(run), Path(checkpoint)
+        if not verify_checkpoint(checkpoint):
+            raise RuntimeError("Refusing to upload incomplete checkpoint")
+        with tempfile.TemporaryDirectory(dir=run.parent) as d:
+            # Model/optimizer files are immutable while training waits here.
+            # Log handlers and TensorBoard may still write in background threads.
+            paths, files = {}, {}
+            for path in sorted(run.rglob("*")):
+                relative = path.relative_to(run)
+                if not path.is_file() or relative.parts[0] == ".lock" or path.name.endswith(".tmp"):
+                    continue
+                if relative.parts[0].startswith("checkpoint-") and relative.parts[0] != checkpoint.name:
+                    continue
+                source = path
+                if relative.parts[0] == "tensorboard" or str(relative) == "run.log":
+                    source = contained(Path(d) / "evidence", str(relative))
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(path, source)
+                paths[str(relative)] = source
+                files[str(relative)] = sha256(source)
+            snapshot = f"snapshots/{checkpoint.name}-{fingerprint(files)[:20]}"
+            info = dict(format="files-v1", checkpoint=checkpoint.name,
+                        step=int(checkpoint.name.split("-")[-1]),
+                        files={name: dict(path=f"{snapshot}/{name}", sha256=digest)
+                               for name, digest in files.items()})
+            pointer = Path(d) / "latest.json"
+            atomic_json(pointer, info)
+            operations = [self._commit_add(path_in_repo=self._path(entry["path"]),
+                          path_or_fileobj=str(paths[name])) for name, entry in info["files"].items()]
+            operations.append(self._commit_add(path_in_repo=self._path("latest.json"),
+                                               path_or_fileobj=str(pointer)))
+            self._call("checkpoint commit", self.api.create_commit, repo_id=self.repo_id,
+                       repo_type="model", operations=operations,
+                       commit_message=f"Checkpoint {self.prefix}: {checkpoint.name}", run_as_future=False)
+        if self._files is not None:
+            self._files.update(entry["path"] for entry in info["files"].values())
+            self._files.add("latest.json")
+
+    def restore(self, run):
+        import shutil
+        run = Path(run)
+        if "latest.json" not in self.names():
+            return super().restore(run)
+        with tempfile.TemporaryDirectory(dir=run.parent) as d:
+            pointer = Path(d) / "latest.json"
+            self.get("latest.json", pointer)
+            info = read_json(pointer)
+            if info.get("format") != "files-v1":
+                return super().restore(run)  # Existing tar snapshots remain supported.
+            local = latest_checkpoint(run)
+            if local and int(local.name.split("-")[-1]) >= info["step"]:
+                return
+            staging = Path(d) / "staging"
+            staging.mkdir()
+            for name, entry in info["files"].items():
+                target = contained(staging, name)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                self.get(entry["path"], target)
+                if sha256(target) != entry["sha256"]:
+                    raise RuntimeError(f"Remote snapshot checksum mismatch: {name}")
+            checkpoint = contained(staging, info["checkpoint"])
+            if not verify_checkpoint(checkpoint):
+                raise RuntimeError("Remote checkpoint missing completion marker")
+            # Rename downloaded files on the same filesystem; no second full copy.
+            for path in sorted(staging.rglob("*"), key=lambda p: (p.name == "COMPLETE.json", str(p))):
+                if path.is_file():
+                    destination = contained(run, str(path.relative_to(staging)))
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    path.replace(destination)
 
     def publish_snapshot(self, archive, remote_name, pointer):
         # The archive and pointer become visible in one atomic Hub commit.

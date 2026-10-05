@@ -229,7 +229,8 @@ class HuggingFaceTests(unittest.TestCase):
             atomic_json(run / "status.json", {"status": "checkpoint_saved"})
             store.backup(run, cp)
             self.assertEqual(len(hub.commits), 1)
-            self.assertEqual(len(hub.commits[0]), 2)
+            self.assertGreater(len(hub.commits[0]), 2)
+            self.assertFalse(any(k.endswith(".tar.gz") for k in hub.files))
             self.assertIn("runs/experiment/latest.json", hub.commits[0])
             restored = Path(d) / "restored"
             restored.mkdir()
@@ -237,7 +238,7 @@ class HuggingFaceTests(unittest.TestCase):
             hub.store().restore(restored)
             self.assertTrue(verify_checkpoint(restored / "checkpoint-12"))
             self.assertEqual((restored / "checkpoint-12/optimizer.pt").read_bytes(), b"optimizer.pt")
-            self.assertNotIn(b"test-secret", next(v for k, v in hub.files.items() if k.endswith(".tar.gz")))
+            self.assertFalse(any(b"test-secret" in v for v in hub.files.values()))
 
     def test_failed_checkpoint_commit_preserves_previous_pointer(self):
         hub = FakeHub(private=True)
@@ -257,13 +258,32 @@ class HuggingFaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             run = Path(d) / "run"
             hub.store().backup(run, fake_checkpoint(run / "checkpoint-10"))
-            archive = next(k for k in hub.files if k.endswith(".tar.gz"))
-            hub.files[archive] = b"broken archive"
+            artifact = next(k for k in hub.files if k.endswith("optimizer.pt"))
+            hub.files[artifact] = b"broken optimizer"
             restored = Path(d) / "restored"
             restored.mkdir()
             with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
                 hub.store().restore(restored)
             self.assertFalse((restored / "checkpoint-10").exists())
+
+    def test_legacy_archive_restore_remains_supported(self):
+        hub = FakeHub(private=True)
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "original"
+            cp = fake_checkpoint(run / "checkpoint-12")
+            from pipeline_recovery import export_checkpoint_adapter
+            export_checkpoint_adapter(cp, run / 'adapter_final')
+            legacy = DriveStore("mock:study")
+            def put(path, relative):
+                hub.files["runs/experiment/" + relative] = Path(path).read_bytes()
+            with patch.object(legacy, "put", side_effect=put):
+                legacy.backup(run, cp)
+            restored = Path(d) / "restored"
+            restored.mkdir()
+            hub.store().restore(restored)
+            self.assertTrue(verify_checkpoint(restored / "checkpoint-12"))
+            self.assertEqual((restored / 'adapter_final/adapter_model.safetensors').read_bytes(),
+                             (cp / 'adapter_model.safetensors').read_bytes())
 
     def test_preparation_and_cache_restore_are_scoped_to_run(self):
         hub = FakeHub(private=True)

@@ -44,7 +44,7 @@ class Model:
 
 
 class TrainingFlowTests(unittest.TestCase):
-    def execute(self, directory, fail_evaluation=False):
+    def execute(self, directory, fail_evaluation=False, fail_checkpoint_once=False, fail_reporting=False, fail_tensorboard=False):
         run = Path(directory)
         cfg = json.loads(pipeline.DEFAULTS.read_text())
         cfg.update(max_steps=1, sample_count=0, sample_at_start=False)
@@ -62,7 +62,8 @@ class TrainingFlowTests(unittest.TestCase):
         model = Model()
         fast = SimpleNamespace(from_pretrained=lambda **kw: (model, tokenizer),
                                get_peft_model=lambda model, **kw: model)
-        cuda = SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None)
+        cuda = SimpleNamespace(synchronize=lambda: None, empty_cache=lambda: None,
+                               memory_allocated=lambda: 0, max_memory_allocated=lambda: 0)
         torch = SimpleNamespace(cuda=cuda, tensor=lambda *a, **kw: Tensor(), empty=lambda *a, **kw: Tensor(),
                                 long='long', uint8='uint8', float16='fp16', bfloat16='bf16',
                                 isfinite=lambda loss: Tensor(), autocast=lambda **kw: nullcontext(),
@@ -71,21 +72,36 @@ class TrainingFlowTests(unittest.TestCase):
         class Trainer:
             def __init__(self, **kwargs):
                 self.args = kwargs['args']; self.callbacks = kwargs['callbacks']
+                self.model = kwargs['model']; self.control = SimpleNamespace()
+                self.save_attempts = 0
                 self.state = SimpleNamespace(global_step=1, max_steps=1, epoch=1.)
             def train(self, resume_from_checkpoint=None):
-                cp = run / 'checkpoint-1'; cp.mkdir()
-                for name in ('adapter_config.json', 'adapter_model.safetensors', 'trainer_state.json',
-                             'optimizer.pt', 'scheduler.pt', 'training_args.bin', 'rng_state.pth'):
-                    (cp / name).write_text('state')
-                self.callbacks[0].on_save(self.args, self.state, None)
+                self.callbacks[0].on_log(self.args, self.state, self.control, logs={'loss': 1.})
+                self.callbacks[0].on_log(self.args, self.state, self.control, logs={'loss': 0.9})
+                self._save_checkpoint(self.model, None)
+                self.callbacks[0].on_save(self.args, self.state, self.control)
                 return SimpleNamespace(metrics={'train_loss': 1.})
+            def _save_checkpoint(self, model, trial):
+                cp = run / 'checkpoint-1'
+                self.save_model(cp, _internal_call=True)
+                for name in ('trainer_state.json', 'optimizer.pt', 'scheduler.pt',
+                             'training_args.bin', 'rng_state.pth'):
+                    (cp / name).write_text('state')
             def save_metrics(self, name, value):
+                if fail_reporting:
+                    raise OSError('optional metrics writer unavailable')
                 (run / (name + '_metrics.json')).write_text(json.dumps(value))
             def save_state(self):
-                pass
-            def save_model(self, destination):
-                destination.mkdir()
+                if fail_reporting:
+                    raise OSError('root trainer-state export unavailable')
+            def save_model(self, destination, **kwargs):
+                destination = Path(destination)
+                destination.mkdir(exist_ok=True)
+                self.save_attempts += 1
                 (destination / 'adapter_model.safetensors').write_text('model')
+                if fail_checkpoint_once and self.save_attempts == 1:
+                    raise RuntimeError('PytorchStreamWriter failed writing file: file write failed')
+                (destination / 'adapter_config.json').write_text('{}')
             def evaluate(self, **kwargs):
                 if fail_evaluation:
                     # Export must already be safe before optional final evaluation.
@@ -94,14 +110,21 @@ class TrainingFlowTests(unittest.TestCase):
                     raise RuntimeError('evaluation kernel unavailable')
                 return {'full_validation_loss': 1.2}
 
-        modules = {'torch': torch, 'numpy': SimpleNamespace(), 'psutil': SimpleNamespace(),
+        modules = {'torch': torch, 'numpy': SimpleNamespace(), 'psutil': SimpleNamespace(
+                       Process=lambda: SimpleNamespace(memory_info=lambda: SimpleNamespace(rss=0))),
                    'unsloth': SimpleNamespace(FastLanguageModel=fast, is_bfloat16_supported=lambda: False),
                    'transformers': SimpleNamespace(Trainer=Trainer, TrainingArguments=lambda **kw: SimpleNamespace(**kw),
                                                    TrainerCallback=object)}
+        if fail_tensorboard:
+            writer = Mock()
+            writer.add_scalar.side_effect = OSError('event writer failed')
+            modules['torch.utils.tensorboard'] = SimpleNamespace(SummaryWriter=lambda **kwargs: writer)
         backend = SimpleNamespace(remote='hf://private', put=Mock(), backup=Mock())
         store = DeferredUploads(backend, run)
         with patch.dict('sys.modules', modules), patch.object(pipeline, 'optional_plots'):
             pipeline.train(cfg, ds, tokenizer, splits, run, store, {'config': cfg}, pipeline.time.monotonic())
+        if fail_tensorboard:
+            self.assertEqual(writer.add_scalar.call_count, 1)
         return run
 
     def test_full_training_control_flow_seals_saves_and_uploads(self):
@@ -118,6 +141,24 @@ class TrainingFlowTests(unittest.TestCase):
             self.assertEqual(json.loads((run / 'status.json').read_text())['status'], 'smoke_complete')
             self.assertEqual(json.loads((run / 'status.json').read_text())['validation'], {})
             self.assertEqual(json.loads((run / 'evaluation_status.json').read_text())['status'], 'failed')
+
+    def test_checkpoint_write_failure_retries_and_finishes_same_training_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.execute(directory, fail_checkpoint_once=True)
+            self.assertTrue((run / 'checkpoint-1' / 'COMPLETE.json').exists())
+            self.assertEqual(json.loads((run / 'status.json').read_text())['status'], 'smoke_complete')
+
+    def test_reporting_failures_do_not_abort_final_export(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.execute(directory, fail_reporting=True)
+            self.assertTrue((run / 'adapter_final' / 'adapter_model.safetensors').exists())
+            self.assertEqual(json.loads((run / 'status.json').read_text())['status'], 'smoke_complete')
+
+    def test_live_tensorboard_failure_disables_only_that_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = self.execute(directory, fail_tensorboard=True)
+            self.assertEqual(json.loads((run / 'status.json').read_text())['status'], 'smoke_complete')
+            self.assertEqual(len((run / 'metrics.jsonl').read_text().splitlines()), 2)
 
 
 if __name__ == '__main__':

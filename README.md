@@ -33,7 +33,7 @@ Use a Linux NVIDIA GPU environment. Kaggle T4 with 4-bit loading is the conserva
 
 Enable **Internet**, choose an **NVIDIA GPU accelerator**, and check the runtime limit and remaining GPU allowance shown in your Kaggle account. Set `session_hours` to a budget **shorter than that displayed limit**, allowing preparation, notebook setup and uploads. The configured value is a user-selected budget, not a claim about Kaggle's session limit; the notebook uses `10.5` as an example to adjust. A full epoch may require several sessions.
 
-Check free disk space. 50 hours of 24kHz mono PCM16 audio is about 8.64GB before file overhead. You also need space for the compressed download, extracted audio, base weights, Arrow caches, three local resumable checkpoints, final adapter and a temporary snapshot archive. Actual use depends on clip lengths, model precision and optimizer state; provision several tens of GB and inspect `df -h /kaggle/working`.
+Check free disk space. 50 hours of 24kHz mono PCM16 audio is about 8.64GB before file overhead. You also need space for the compressed download, extracted audio, base weights, Arrow caches, retained resumable checkpoints and upload buffers (a full temporary snapshot archive is needed only for Drive); final adapter weights share the final checkpoint’s local storage where hardlinks are supported. Actual use depends on clip lengths, model precision and optimizer state; provision several tens of GB and inspect `df -h /kaggle/working`.
 
 The complete GPU workflow has **not been run in this local macOS workspace**. CPU tests exercise both storage backends, including mocked Hub upload/restore and failed-commit recovery; authenticated remote transfers, Unsloth/CUDA installation, ZIP contents and GPU training must be verified in your Kaggle smoke run. The public Drive page was inspected; the multi-GB ZIP was not downloaded here.
 
@@ -220,8 +220,8 @@ YOUR_USERNAME/orpheus-urdu-checkpoints  [private model repository]
   runs/<run_id>/
     preparation/
     cache/<fingerprint>/
-    snapshots/checkpoint-100-<hash>.tar.gz
-    snapshots/checkpoint-200-<hash>.tar.gz
+    snapshots/checkpoint-100-<hash>/<checkpoint and evidence files>
+    snapshots/checkpoint-200-<hash>/<checkpoint and evidence files>
     latest.json
     connection_probe.json
 ```
@@ -240,9 +240,9 @@ orpheus_urdu/<run_id>/
 
 1. Encoding commits each 100-row chunk locally, computes its checksum and copies it to the selected private remote store with its metadata. A restart validates and reuses completed chunks. A chunk whose metadata/upload was interrupted is recomputed or uploaded again.
 2. Trainer checkpoints include adapter weights, optimizer, scheduler, mixed-precision state when applicable, RNG state, Trainer state and tokenizer. The script verifies required files, hashes the checkpoint files and writes `COMPLETE.json` only after saving finishes.
-3. A tar snapshot includes the current complete checkpoint and experiment evidence. It excludes other checkpoint directories, the local lock and the separate token cache.
+3. Hugging Face uploads checkpoint and evidence files directly, without building a local tar archive. Drive uses a tar snapshot. Both exclude other checkpoint directories, the local lock and the separate token cache.
 4. Hugging Face publishes the snapshot and `latest.json` in **one synchronous commit**. Drive uploads the immutable snapshot first and updates the pointer only after success. If upload/commit fails, the verified checkpoint stays local, training continues, and a queue records the pending upload. The previous remote checkpoint remains the remote resume target until a newer upload succeeds. An outage cooldown prevents every optional file from repeatedly blocking on network retries.
-5. Snapshot archive hashes and checkpoint file hashes are verified on restore. A newer verified local checkpoint wins over an older remote checkpoint. Incomplete local checkpoint directories without a completion marker are skipped. A checksum mismatch raises an error so corruption is investigated rather than quietly used.
+5. Direct snapshot file hashes (or legacy/Drive archive hashes) and checkpoint file hashes are verified on restore. A newer verified local checkpoint wins over an older remote checkpoint. Incomplete local checkpoint directories without a completion marker are skipped. A damaged newest local checkpoint is skipped in favor of an older verified checkpoint, with a warning; damaged files are preserved. If none verifies, training stops rather than silently restarting.
 6. Periodic samples are generated after the first checkpoint upload, then an updated snapshot is uploaded with the samples. Training RNG state is restored after monitoring. Each checkpoint may therefore have two immutable remote snapshots.
 7. Local retention is bounded; remote snapshots are retained for research/recovery and are never automatically deleted. Budget Hub/Drive space for adapter **and optimizer** state at each saved step. Choose a larger `save_steps` after the smoke run if upload/storage cost is excessive, and archive/remove obsolete snapshots manually after verifying your retained recovery copies. Hub repository history has its own storage implications.
 
@@ -283,7 +283,7 @@ run.mkdir(parents=True, exist_ok=True)
 store.restore(run)
 ```
 
-Snapshots are archives in an artifact repository. `PeftModel.from_pretrained("YOUR_USERNAME/orpheus-urdu-checkpoints")` will not load an adapter directly from its root. Restore the archive and pass the resulting local `adapter_final` or `checkpoint-N` directory to `synthesize.py`.
+Snapshots are versioned files in the Hub artifact repository, or archives for Drive/older runs. `PeftModel.from_pretrained("YOUR_USERNAME/orpheus-urdu-checkpoints")` will not load an adapter directly from its root. Restore the snapshot and pass the resulting local `adapter_final` or `checkpoint-N` directory to `synthesize.py`.
 
 For optional Drive inspection:
 
@@ -416,6 +416,7 @@ from pathlib import Path
 REPO_URL = "https://github.com/hassan-31x/orpheus-ft-urdu.git"
 REPO_REF = "main"  # Use the same fixed commit for an experiment and its resumes.
 HF_REPO_ID = "hassan-31x/orpheus-urdu-checkpoints"  # Your private model repository.
+RUN_ID_OVERRIDE = None  # Optional separate experiment; unsaved failed attempts recover automatically.
 AUDIT_ONLY = False  # Set True with GPU OFF to inspect data before training.
 MINIMUM_TRAIN_HOURS = 35  # The 47h archive contains ~38h train plus validation/test.
 SESSION_HOURS = 10.5  # Set below the limit displayed in your Kaggle account.
@@ -462,6 +463,8 @@ subprocess.run(["df", "-h", "/kaggle/working"], check=True)
 ```python
 import json
 cfg = json.loads((REPO / "configs/aslp50h.json").read_text())
+if RUN_ID_OVERRIDE:
+    cfg["run_id"] = RUN_ID_OVERRIDE
 cfg["checkpoint_backend"] = "huggingface"
 cfg["hf_repo_id"] = HF_REPO_ID
 cfg["session_hours"] = SESSION_HOURS
@@ -486,13 +489,12 @@ if AUDIT_ONLY:
 try:
     subprocess.run(command, cwd=REPO, check=True)
 except subprocess.CalledProcessError:
-    for name in ("data_error_summary.json", "data_errors.json"):
-        path = RUN / name
-        if path.exists():
-            value = json.loads(path.read_text())
-            print("Diagnostic file:", path)
-            print(json.dumps(value if isinstance(value, dict) else value[:10], indent=2, ensure_ascii=False))
-    print("The subprocess stopped. Training does not restart automatically; inspect the error before rerunning.")
+    import shutil
+    print("Free disk GiB:", round(shutil.disk_usage(RUN).free / 2**30, 2))
+    path = RUN / "disk_budget.json"
+    if path.exists():
+        print("Disk budget:", path.read_text())
+    print("Training process exited. The traceback above is the failure; audit exclusions are separate.")
     raise
 ```
 
@@ -520,18 +522,25 @@ This detaches the process from the cell; it does not remove session inactivity/r
 
 ```python
 from IPython.display import Audio, display
-status = RUN / "status.json"
-print(json.loads(status.read_text()) if status.exists() else ("Dataset audit only; no training started" if AUDIT_ONLY else "No training status recorded"))
+
+def optional_json(path):
+    try:
+        return json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, ValueError) as exc:
+        print("Optional report unavailable:", path.name, type(exc).__name__)
+        return {}
+
+status_value = optional_json(RUN / "status.json")
+print(status_value or ("Dataset audit only" if AUDIT_ONLY else "No training status recorded"))
 for path in sorted((RUN / "samples").glob("step-*/*.wav"))[-3:]:
     print(path)
     try:
         display(Audio(filename=str(path)))
     except (OSError, ValueError) as exc:
         print("Optional playback unavailable:", type(exc).__name__)
-
-backup = RUN / "backup_status.json"
-if backup.exists():
-    print("Remote backup:", json.loads(backup.read_text()))
+backup = optional_json(RUN / "backup_status.json")
+if backup:
+    print("Remote backup:", backup)
 ```
 
 In the saved-run path this cell executes after 4A returns. During an interactive detached run you can execute it repeatedly.
@@ -542,8 +551,8 @@ In the saved-run path this cell executes after 4A returns. During an interactive
 if AUDIT_ONLY:
     print("Dataset audit completed; set AUDIT_ONLY=False and enable GPU for training.")
 else:
-    status_value = json.loads((RUN / "status.json").read_text())
-    if status_value["status"] in ("complete", "smoke_complete"):
+    status_value = optional_json(RUN / "status.json")
+    if status_value.get("status") in ("complete", "smoke_complete"):
         output = Path("/kaggle/working/urdu_test.wav")
         try:
             subprocess.run([TRAIN_PYTHON, str(REPO / "synthesize.py"),
@@ -551,10 +560,13 @@ else:
                             "--text", "آج موسم بہت خوشگوار ہے اور ہم سب باہر سیر کے لیے جا رہے ہیں۔",
                             "--output", str(output)], cwd=REPO, check=True)
             display(Audio(filename=str(output)))
-        except subprocess.CalledProcessError as exc:
+        except (subprocess.CalledProcessError, OSError, ValueError) as exc:
             print("Training adapter is saved at", RUN / "adapter_final")
             print("Optional final synthesis failed; training remains complete. See synthesis_status.json.")
-            (RUN / "synthesis_status.json").write_text(json.dumps({"status": "failed", "returncode": exc.returncode}))
+            try:
+                (RUN / "synthesis_status.json").write_text(json.dumps({"status": "failed", "returncode": getattr(exc, "returncode", None), "error_type": type(exc).__name__}))
+            except OSError:
+                print("Could not write the optional synthesis report.")
 
     else:
         print("Saved for continuation; rerun the same config to finish the epoch.")
@@ -568,7 +580,7 @@ A traceback with `invalid/duplicate rows` means the audit rejected rows before e
 
 The training subprocess exits after this error. If the saved notebook still says Running, it may be finishing output conversion; stopping that failed job does not interrupt active training. Save/download the diagnostic JSON before ending an interactive session if remote backup is unavailable. Updating GitHub will not update a process or notebook already running.
 
-Before using more GPU time, import the updated notebook, set `AUDIT_ONLY=True` in Cell 1, turn GPU off, and run it. This downloads/checks the data without model imports or tokenization. Exclusions now pass automatically under permissive defaults while retention warnings are recorded; train and validation must still remain nonempty. After it passes, set `AUDIT_ONLY=False`, enable GPU, and run the separate two-step smoke experiment before the full epoch. A CPU audit does not prove the CUDA training, VRAM budget or live checkpoint restore will succeed. Same-data/source/config requirements for checkpoint resume still apply; do not switch an existing trained run to modified code. An audit failure before encoding has no training checkpoint to preserve.
+Before using more GPU time, import the updated notebook, set `AUDIT_ONLY=True` in Cell 1, turn GPU off, and run it. This downloads/checks the data without model imports or tokenization. Exclusions now pass automatically under permissive defaults while retention warnings are recorded; train and validation must still remain nonempty. After it passes, set `AUDIT_ONLY=False` and enable GPU. The actual run exercises checkpointing at optimizer step 1; a separate smoke experiment is optional. A CPU audit does not prove the CUDA training, VRAM budget or live checkpoint restore will succeed. Same-data/source/config requirements for checkpoint resume still apply; do not switch an existing trained run to modified code. An audit failure before encoding has no training checkpoint to preserve.
 
 ## Automatic fallbacks and their limits
 
@@ -596,11 +608,11 @@ Unreadable/invalid audio encountered during encoding, codec OOM on an individual
 
 `pending_uploads.json` and `backup_status.json` track remote writes. Failed uploads use a 60-second cooldown, then retry on subsequent writes/checkpoints; at most eight queued optional files drain per successful checkpoint. Final and completed-run backup attempts bypass cooldown once. Training can finish locally with **remote backup pending**. If Kaggle deletes that runtime before uploads succeed, only the previously uploaded checkpoint is recoverable; queued files are not remote backups. Check the displayed backup status before discarding outputs. No credential values are put in the queue.
 
-Optional TensorBoard, plotting, sample generation, validation and final notebook synthesis failures are recorded rather than turning usable training progress into a failed notebook. `evaluation_status.json` records unavailable evaluation; no placeholder loss is fabricated. The final adapter is exported before whole-validation evaluation. Canonical `metrics.jsonl` and checkpoint files remain required.
+Optional TensorBoard, plotting, sample generation, validation and final notebook synthesis failures are recorded rather than turning usable training progress into a failed notebook. `evaluation_status.json` records unavailable evaluation; no placeholder loss is fabricated. The final adapter is exported before whole-validation evaluation. Canonical `metrics.jsonl` remains the primary metric record; a reporting IO failure is warned in stdout and may leave gaps. Checkpoint files remain required for safe resume.
 
 ### Disk-full checkpoint failure (October 5 fix)
 
-`SafetensorError ... No space left on device` means the model was training but its checkpoint could not be written. PEFT can include frozen, resized embedding weights, so adapter saves can be much larger than the LoRA matrices. This version keeps those weights for correctness, budgets them plus optimizer state and temporary upload archives, checks free disk before training and each save, saves at optimizer step 1, and prunes older verified checkpoints under pressure while preserving the newest and any pending upload. A checkpoint write that runs out of space removes only its unsealed partial directory and retries once in the same process. Insufficient space after cleanup remains a hard failure; skipping every save would leave training unprotected.
+`SafetensorError ... No space left on device` means the model was training but its checkpoint could not be written. PEFT can include frozen, resized embedding weights, so adapter saves can be much larger than the LoRA matrices. This version keeps those weights for correctness, budgets them plus optimizer state (and temporary upload archives only for the Drive backend), checks free disk before training and each save, saves at optimizer step 1, and prunes older verified checkpoints under pressure while preserving the newest and any pending upload. A checkpoint write that runs out of space removes only its unsealed partial directory and retries once in the same process. Insufficient space after cleanup remains a hard failure; skipping every save would leave training unprotected.
 
 The dataset ZIP is removed after successful extraction, and a completed extraction is reused without downloading it again. WAVs and encoded data remain available. Dependency installation now uses `--no-cache-dir`. The notebook prints disk diagnostics instead of misleading old audit exclusions. `disk_budget.json` records estimated requirements and free space. Budgets are conservative estimates, not a guarantee against other processes consuming disk.
 
@@ -629,3 +641,27 @@ Do not delete Hugging Face model caches, extracted WAVs, or sealed checkpoints t
 ### Updated code after an attempt without a saved checkpoint
 
 A changed source fingerprint used to stop even when only preparation metadata existed. The script now checks for a verified checkpoint first. With no verified checkpoint, it preserves earlier evidence in `attempt_history/`, records `attempt_recovery.jsonl`, clears stale memory selections and per-attempt metrics, and continues automatically from optimizer step zero. Audio and content-addressed caches remain; cache reuse still requires the current fingerprint. With a verified checkpoint, a mismatched identity still stops rather than altering saved training semantics. An empty Hugging Face commit warning is informational and is unrelated to this check.
+
+### Reduced local checkpoint storage for Hugging Face
+
+Hugging Face snapshots now use `files-v1`: the complete checkpoint, experiment evidence and `latest.json` are published in one synchronous commit, directly from existing files. No full tar copy is written locally. Restores verify every downloaded file and the sealed checkpoint before moving files into the run directory; older archive snapshots remain readable.
+
+The free-space requirement is the next checkpoint estimate plus 512 MiB of margin. Existing files are already reflected in measured free space. Older verified checkpoints are removed under pressure while the newest and pending-upload checkpoint are protected. Final adapter export is budgeted when it occurs, rather than being reserved throughout training. Drive still reserves an additional checkpoint/archive copy and experiment evidence.
+
+For the supplied failure (checkpoint estimate 4,903,436,288 bytes), the Hugging Face check now requires **5.07 GiB**, within the logged **10.57 GiB** free. This is an estimate; external writes and transfer-library buffers can still consume storage. Update the GitHub project, rerun the notebook fetch cell and training cell using the existing config/run ID. No new secret, dependency install, manual disk-limit override, or checkpoint-format setting is needed.
+
+### Full review: preventing late failures and repeated preparation
+
+The run now starts monitoring after its first saved optimizer step by default (`sample_at_start=false`). It uploads a checkpoint before plotting or synthesis and skips that optional work near session cutoff. TensorBoard is managed by the monitor and disabled if its writer fails; JSONL continues. Optional metrics/status reports, validation IO failures, nonfinite validation results, plotting and notebook playback errors cannot by themselves abort the optimization process. Missing metrics are reported as unavailable, never invented.
+
+The final adapter reuses the verified final checkpoint weights through hardlinks on the same filesystem, avoiding another multi-GB serialization. Filesystems without hardlinks fall back to copying. Editing exported adapter weights in place would also change their linked checkpoint; treat both as immutable model artifacts.
+
+Hub backups take stable copies of live logs and TensorBoard events before hashing/uploading; model and optimizer files are uploaded directly. Unreadable optional upload queues are rebuilt. If a remote restore fails but a verified local checkpoint exists, the local checkpoint is used. No local checkpoint means a failed remote restore still stops, since silently starting over could overwrite recoverable remote progress.
+
+A damaged newest local checkpoint falls back to an older checksum-verified copy. A corrupt-only checkpoint set stops. Trainer retains at least two checkpoint directories during saving so rotation cannot remove the last good predecessor before the new save is sealed; disk-pressure pruning continues to protect the newest verified checkpoint.
+
+Storage/reporting edits no longer necessarily force SNAC encoding again. Reuse requires identical data/model/tokenizer/codec/settings/package fingerprints AND matching parsed implementations of the token-producing functions/constants in captured source. Changes to tokenization or data rebuild the cache. Preparation backups now include source and token-format evidence so this comparison is also possible across sessions. The encoding source fingerprint is retained when compatibility is proven, while training source hashes record the current code.
+
+Re-running setup installs missing/incompatible requirements without upgrading already-satisfying packages. Captured run/source now includes default config files, and executing captured sources does not fail by copying a file onto itself. Incompatible saved training sources are detected before GPU imports and audio audit.
+
+Use the updated notebook cells from this README or `kaggle_run.ipynb`. Keep the existing run ID for your attempt with no verified checkpoint. Once training has a checkpoint, keep its recorded source/environment for resumes. The remaining hard failures are invalid optimization state, unusable CUDA/kernel state, no usable data, and inability to write any safe checkpoint after recovery. These cannot be treated as successful training.

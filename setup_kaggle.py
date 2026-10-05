@@ -57,8 +57,7 @@ def main():
     constraints.write_text('\n'.join(locked) + '\n')
     create_environment(target, evidence)
     python = str(target / 'bin' / 'python')
-    command = [python, '-m', 'pip', 'install', '--no-cache-dir', '--upgrade', '--upgrade-strategy',
-               'only-if-needed', '--constraint', str(constraints), '--report',
+    command = [python, '-m', 'pip', 'install', '--no-cache-dir', '--constraint', str(constraints), '--report',
                str(evidence / 'installation.json'), '-r', str(repo / 'requirements-kaggle.txt')]
     # Stream output to both Kaggle and a persistent setup log, preserving failure.
     with (evidence / 'installation.log').open('a') as log:

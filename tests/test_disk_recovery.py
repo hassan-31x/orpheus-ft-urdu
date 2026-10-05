@@ -39,3 +39,32 @@ class DiskTests(unittest.TestCase):
             self.assertFalse(cps[0].exists())
             self.assertTrue(cps[1].exists())
             self.assertTrue(cps[2].exists())
+
+    def test_reported_kaggle_capacity_supports_direct_snapshot(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch('shutil.disk_usage', return_value=SimpleNamespace(free=11344220160)):
+                report = ensure_checkpoint_space(d, 4903436288, remote=True, archive_snapshots=False)
+            self.assertTrue(report['enough'])
+            self.assertEqual(report['required_bytes'], 4903436288 + 512 * 1024**2)
+            self.assertEqual(report['snapshot_format'], 'direct_files')
+
+    def test_archive_backend_still_reserves_upload_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            with patch('shutil.disk_usage', return_value=SimpleNamespace(free=20 * 1024**3)):
+                report = ensure_checkpoint_space(d, 4903436288, remote=True)
+            self.assertEqual(report['required_bytes'], 2 * 4903436288 + 512 * 1024**2)
+
+    def test_later_save_reclaims_old_checkpoint_without_deleting_latest(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            first, latest = run / 'checkpoint-1', run / 'checkpoint-100'
+            first.mkdir(); latest.mkdir()
+            estimate = 4903436288
+            def capacity(_):
+                count = len(list(run.glob('checkpoint-*')))
+                return SimpleNamespace(free=11344220160 - count * estimate)
+            with patch('orpheus_utils.latest_checkpoint', return_value=latest), patch('pipeline_recovery.verify_checkpoint', return_value=True), patch('shutil.disk_usage', side_effect=capacity):
+                report = ensure_checkpoint_space(run, estimate, remote=True, archive_snapshots=False)
+            self.assertEqual(report['removed_old_checkpoints'], ['checkpoint-1'])
+            self.assertTrue(latest.exists())
+            self.assertTrue(report['enough'])
