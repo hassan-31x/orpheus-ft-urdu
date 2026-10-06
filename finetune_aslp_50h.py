@@ -86,6 +86,12 @@ def cli():
             p.error(f"{k} must be null or a positive integer")
     if (cfg["test_train_clips"] or cfg["test_validation_clips"]) and "smoke" not in cfg["run_id"]:
         p.error("A test clip subset requires 'smoke' in run_id to distinguish it from full-epoch results")
+    if cfg["init_from_run"] is not None:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}", str(cfg["init_from_run"])) \
+                or cfg["init_from_run"] == cfg["run_id"]:
+            p.error("init_from_run must be a DIFFERENT, finished run_id in the same Hugging Face repo")
+        if cfg["checkpoint_backend"] != "huggingface":
+            p.error("init_from_run needs checkpoint_backend=huggingface")
     if cfg["sampling"] not in ("random", "length") or cfg["precision"] not in ("4bit", "16bit"):
         p.error("Invalid sampling or precision")
     if cfg["speaker_column"] is not None and not cfg["speaker_column"]:
@@ -143,6 +149,74 @@ def upload_files(store, items):
     else:
         for local, relative in items:
             store.put(local, relative)
+
+
+def stage_init_run(cfg, work, run, token, store_factory=None):
+    """Seed a NEW run from a finished one: its final LoRA weights and encoded-token cache.
+
+    Only weights are inherited; the optimizer, LR schedule and data order start fresh, so
+    this is a genuine second epoch. Once the new run has its own checkpoint it resumes
+    from that and this does nothing. Returns the adapter directory, or None.
+    """
+    source = cfg.get("init_from_run")
+    if not source or latest_checkpoint(run) is not None:
+        return None
+    import shutil
+    target, marker = run / "init_adapter", run / "init_source.json"
+    if marker.is_file() and (target / "adapter_model.safetensors").is_file():
+        return target
+    factory = store_factory or (lambda run_id: HuggingFaceStore(cfg["hf_repo_id"], run_id, token))
+    prior = factory(source)
+    staging = work / "init_runs" / source
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    set_activity(f"fetching previous run {source}")
+    prior.restore(staging)
+    checkpoint = latest_checkpoint(staging)
+    if checkpoint is None:
+        raise RuntimeError(f"Run {source!r} has no verified checkpoint in {cfg['hf_repo_id']}; "
+                           "check init_from_run (nothing was changed)")
+    status = read_json(staging / "status.json") if (staging / "status.json").is_file() else {}
+    if status.get("status") != "complete":
+        raise RuntimeError(f"Run {source!r} is {status.get('status')!r}, not 'complete'. Finish that run first "
+                           "(a TEST/smoke run or an unfinished epoch cannot seed another epoch)")
+    target.mkdir(exist_ok=True)
+    for name in ("adapter_config.json", "adapter_model.safetensors"):
+        shutil.copy2(checkpoint / name, target / (name + ".tmp"))
+        (target / (name + ".tmp")).replace(target / name)
+    atomic_json(marker, dict(init_from_run=source, checkpoint=checkpoint.name, step=status.get("step"),
+                             adapter_sha256=sha256(target / "adapter_model.safetensors")))
+    LOG.info("Initialising %s from run %s (%s, adapter sha256 %s...)", cfg["run_id"], source,
+             checkpoint.name, read_json(marker)["adapter_sha256"][:12])
+    # Reuse the previous run's SNAC-encoded tokens when the data and encoding code are unchanged.
+    try:
+        if (staging / "token_format.json").is_file() and not (run / "token_format.json").exists():
+            shutil.copy2(staging / "token_format.json", run / "token_format.json")
+            if (staging / "source").is_dir():
+                shutil.copytree(staging / "source", run / "source", dirs_exist_ok=True)
+            old_cache = fingerprint(read_json(staging / "token_format.json"))
+            prior.restore_files("cache/" + old_cache, work / "cache" / old_cache, skip_existing=True)
+    except Exception as exc:
+        LOG.warning("Previous token cache not reused (%s); audio will be re-encoded", type(exc).__name__)
+    shutil.rmtree(staging, ignore_errors=True)
+    return target
+
+
+def load_init_adapter(model, directory):
+    """Load previous LoRA weights into the fresh adapter, failing loudly on any mismatch."""
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+    state = load_file(str(Path(directory) / "adapter_model.safetensors"))
+    result = set_peft_model_state_dict(model, state)
+    unexpected = list(getattr(result, "unexpected_keys", None) or [])
+    lora = {n: p for n, p in model.named_parameters() if "lora_" in n}
+    if unexpected or sum("lora_" in k for k in state) != len(lora):
+        raise RuntimeError(f"Previous adapter does not match this model (unexpected keys: {unexpected[:3]}, "
+                           f"adapter tensors {len(state)}, model LoRA tensors {len(lora)}); "
+                           "keep rank/lora_alpha/targets equal to the previous run")
+    if not any(float(p.detach().abs().sum()) > 0 for n, p in lora.items() if "lora_B" in n):
+        raise RuntimeError("Previous adapter loaded as all zeros; refusing to train from an untrained adapter")
+    LOG.info("Loaded %d LoRA tensors from the previous run's adapter", len(lora))
 
 
 def find_data(cfg, work):
@@ -565,6 +639,8 @@ def train(cfg, ds, tokenizer, splits, run, store, identity, session_start):
                                        archive_snapshots=getattr(store, "archive_snapshots", True))
     check_disk()  # Before any optimizer steps, including on fresh runs.
     previous = latest_checkpoint(run)
+    if previous is None and cfg.get("init_from_run"):
+        load_init_adapter(model, run / "init_adapter")
     def probe_memory(row):
         try:
             # AdamW moments and step temporaries are allocated after the first real
@@ -887,6 +963,8 @@ def main():
                 LOG.info("Dataset audit passed. No model loaded or training started")
                 return
             store.restore(run)
+            if cfg.get("init_from_run"):
+                stage_init_run(cfg, work, run, os.environ.get("HF_TOKEN"))
             existing = latest_checkpoint(run)
             if existing is not None:
                 previous_identity = read_json(existing / "run_identity.json")

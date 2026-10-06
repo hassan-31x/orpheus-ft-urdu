@@ -50,5 +50,6 @@
   "enforce_retention_limits": false,
   "optimizer": "adamw_torch",
   "test_train_clips": null,
-  "test_validation_clips": null
+  "test_validation_clips": null,
+  "init_from_run": null
 }
